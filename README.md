@@ -38,6 +38,16 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
 - **JSON export** - Programmatic access for custom analytics
 - **Configurable date ranges** - Export last 7, 30, or 90 days
 
+## Screenshots
+
+### Main Dashboard View
+![Main Dashboard](screenshots/dashboard-main.png)
+*Overview of agent performance with cost and context growth charts. Shows sidebar with all agents, stats cards, and expandable heartbeat rows.*
+
+### Detailed Heartbeat Analysis
+![Heartbeat Details](screenshots/dashboard-detail.png)
+*Expanded heartbeat view showing cost per step, tool usage breakdown, cost breakdown, and detailed step-by-step execution with full tool call/result inspection.*
+
 ## Installation
 
 ### Prerequisites
