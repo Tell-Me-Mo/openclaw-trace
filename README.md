@@ -41,11 +41,13 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
 ## Screenshots
 
 ### Main Dashboard View
-![Main Dashboard](screenshots/dashboard-main.png)
+<img width="1911" height="524" alt="image" src="https://github.com/user-attachments/assets/48b6a3ce-ddf9-493c-ae3b-c0778629f225" />
+
 *Overview of agent performance with cost and context growth charts. Shows sidebar with all agents, stats cards, and expandable heartbeat rows.*
 
 ### Detailed Heartbeat Analysis
-![Heartbeat Details](screenshots/dashboard-detail.png)
+<img width="1884" height="716" alt="image" src="https://github.com/user-attachments/assets/d1e6ec2c-8956-4f49-86da-711fce27075f" />
+
 *Expanded heartbeat view showing cost per step, tool usage breakdown, cost breakdown, and detailed step-by-step execution with full tool call/result inspection.*
 
 ## Installation
