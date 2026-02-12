@@ -46,7 +46,9 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
    ```bash
    mkdir -p ~/.openclaw/canvas
    cp token-dash.js ~/.openclaw/canvas/
-   cp budget.json ~/.openclaw/canvas/  # Optional: default budget config
+   cp budget.json ~/.openclaw/canvas/        # Optional: default budget config
+   cp dashboard-helper.sh ~/.openclaw/canvas/ # Optional: bash helper functions
+   cp API.md ~/.openclaw/canvas/              # Optional: API documentation
    ```
 
 3. **Create budget configuration (optional):**
@@ -78,17 +80,52 @@ Open your browser to **http://localhost:3141**
 
 ### Navigation
 
+- **Sidebar Toggle** - Click ☰ button to hide/show the agent sidebar for more screen space
 - **Sidebar** - Click any agent to view its details
 - **Overview** - Default view showing all agents and 7-day trend
 - **Agent View** - Session cost, heartbeats, cache stats, and full drill-down
-- **Compare Mode** - Click "Enter compare mode" → select 2 heartbeats → view delta
+- **Compare Mode** - Click "Compare" button in header → select 2 heartbeats → view delta
+- **API Buttons** - Each heartbeat has 📋 API and ⚠ API buttons to copy URLs for programmatic access
 
-### Export Data
+### API Access for Agents
 
-- **CSV**: Click "↓ CSV" button or visit `http://localhost:3141/api/export?format=csv&days=7`
-- **JSON**: Click "↓ JSON" button or visit `http://localhost:3141/api/export?format=json&days=7`
+The dashboard provides REST API endpoints that agents can use for self-improvement and optimization:
 
-Change `days=7` to any number for different date ranges.
+```bash
+# Source helper functions
+source ~/.openclaw/canvas/dashboard-helper.sh
+
+# Check if budget allows running
+if dashboard_check_budget; then
+  echo "Budget OK, running agent..."
+else
+  echo "Budget exceeded, skipping"
+  exit 1
+fi
+
+# Get latest heartbeat data
+latest=$(dashboard_latest_hb "promo-assistant-reddit")
+cost=$(echo $latest | jq -r '.totalCost')
+errors=$(echo $latest | jq -r '.errorCount')
+
+# Get only error steps from previous run
+errors_only=$(dashboard_latest_errors_only "promo-assistant-reddit")
+```
+
+**Available API endpoints:**
+- `/api/agents` - List all agents with stats
+- `/api/agent/:id` - Get specific agent details
+- `/api/latest?agent=X` - Get latest heartbeat
+- `/api/heartbeat?agent=X&hb=N` - Get specific heartbeat by index
+- `/api/heartbeats?agent=X&errors=true` - Query heartbeats with filters
+- `/api/budget` - Get current budget status
+- `/api/daily?days=N` - Get daily cost breakdown
+- `/api/stats` - Overall system statistics
+
+**Error filtering:**
+Add `&errors_only=true` to any heartbeat endpoint to get only steps with errors. Perfect for debugging and self-correction loops.
+
+See [API.md](API.md) and [ERRORS_ONLY_FEATURE.md](ERRORS_ONLY_FEATURE.md) for complete documentation.
 
 ## Configuration
 
