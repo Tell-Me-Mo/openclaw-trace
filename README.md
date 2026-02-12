@@ -6,38 +6,6 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
 
 ![Dashboard Preview](https://img.shields.io/badge/OpenClaw-Extension-blue)
 
-## Features
-
-### 📊 Real-Time Monitoring
-- **Live status indicators** - Green/yellow/grey dots show agent activity at a glance
-- **Auto-refresh** - Updates every 30 seconds without manual reload
-- **Cross-agent overview** - Compare performance across all 10+ platform agents
-
-### 💰 Budget Management
-- **Daily/monthly budget tracking** - Set spending limits and track progress
-- **Projected costs** - Forecasts monthly spend based on 7-day average
-- **Budget alerts** - Color-coded warnings (green/yellow/red) when approaching limits
-
-### 📈 Historical Analysis
-- **7-day cost trend chart** - Multi-line graph showing per-agent breakdown
-- **Per-heartbeat drill-down** - Inspect every API call with full token/cost details
-- **Context growth tracking** - Visualize how context size evolves over time
-
-### ⚡ Optimization Tools
-- **Cache hit rate visualization** - See cache efficiency per-heartbeat and per-agent
-- **Token waste detection** - Automatic flags for runaway loops, large results, bloated context, low cache hits
-- **Optimization hints** - Actionable suggestions to reduce costs
-
-### 🔍 A/B Comparison
-- **Side-by-side session comparison** - Select 2 heartbeats to compare
-- **Delta calculations** - See exact improvements in cost, steps, cache%, context
-- **Perfect for validating prompt optimizations**
-
-### 📤 Data Export
-- **CSV export** - Download full history for spreadsheet analysis
-- **JSON export** - Programmatic access for custom analytics
-- **Configurable date ranges** - Export last 7, 30, or 90 days
-
 ## Screenshots
 
 ### Main Dashboard View
@@ -49,6 +17,18 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
 <img width="1884" height="716" alt="image" src="https://github.com/user-attachments/assets/d1e6ec2c-8956-4f49-86da-711fce27075f" />
 
 *Expanded heartbeat view showing cost per step, tool usage breakdown, cost breakdown, and detailed step-by-step execution with full tool call/result inspection.*
+
+## Features
+
+- 📊 **Real-time monitoring** - Live agent status, auto-refresh, cross-agent overview
+- 💰 **Budget tracking** - Daily/monthly limits with projected costs and alerts
+- 📈 **Historical analysis** - 7-day trends, per-heartbeat drill-down, context growth
+- ⚡ **Optimization tools** - Cache hit rates, waste detection, actionable hints
+- 🔍 **A/B comparison** - Side-by-side heartbeat comparison with delta calculations
+- 🎛️ **Collapsible sidebar** - Toggle agent list for more screen space
+- 📊 **Rich charts** - Cost, context, and tool usage visualizations
+- 🔍 **Step inspection** - Full tool call/result details with expandable views
+- 📤 **API access** - Programmatic access to all metrics via REST API
 
 ## Installation
 
