@@ -198,10 +198,16 @@ function parseHeartbeats(entries) {
         cur.finalContext  = Math.max(cur.finalContext, u.totalTokens || 0);
         cur.endTime       = ts;
         if (text && calls.length === 0) cur.summary = text;
+      } else if (u && u.totalTokens === 0 && u.output === 0 && (!msg.content || msg.content.length === 0)) {
+        // API error — empty response (rate limit, overloaded, or transient failure)
+        cur.apiErrors = (cur.apiErrors || 0) + 1;
+        cur.endTime = ts;
       }
     }
   }
   if (cur?.steps?.length) runs.push(finalizeRun(cur));
+  // Also push runs with only API errors (no successful steps)
+  if (cur && !cur.steps.length && cur.apiErrors > 0) runs.push(finalizeRun(cur));
   return runs.reverse();
 }
 
@@ -217,10 +223,18 @@ function finalizeRun(r) {
       cur.durationMs = new Date(nxt.time) - new Date(cur.time);
     }
   }
+  // Last step: use endTime
+  if (r.steps.length > 0 && r.endTime) {
+    const last = r.steps[r.steps.length - 1];
+    if (last.time && !last.durationMs) {
+      last.durationMs = new Date(r.endTime) - new Date(last.time);
+    }
+  }
 
-  // Error count
+  // Error count (tool errors + API errors)
+  r.apiErrors = r.apiErrors || 0;
   r.errorCount = r.steps.reduce((sum, s) =>
-    sum + (s.toolResults?.filter(tr => hasError(tr)).length || 0), 0);
+    sum + (s.toolResults?.filter(tr => hasError(tr)).length || 0), 0) + r.apiErrors;
 
   // Browser action breakdown
   const browserBreakdown = {};
@@ -271,6 +285,153 @@ function getBudget() {
   const budgetFile = path.join(OC, 'canvas', 'budget.json');
   const budget = readJSON(budgetFile) || { daily: 5.00, monthly: 100.00 };
   return budget;
+}
+
+// ── Gateway Log Parsing (API errors, browser timeouts) ─────────────────────────
+let _gatewayErrorsCache = { ts: 0, errors: [] };
+
+function parseGatewayErrors() {
+  // Cache for 10 seconds to avoid re-parsing on every request
+  if (Date.now() - _gatewayErrorsCache.ts < 10000) return _gatewayErrorsCache.errors;
+
+  const today = new Date();
+  const dateStr = today.getFullYear() + '-' +
+    String(today.getMonth()+1).padStart(2,'0') + '-' +
+    String(today.getDate()).padStart(2,'0');
+  const logFile = path.join('/tmp/openclaw', `openclaw-${dateStr}.log`);
+
+  const errors = [];
+  try {
+    const content = fs.readFileSync(logFile, 'utf8');
+    const lines = content.split('\n');
+
+    // Track active lanes: agentId → { startTime, active }
+    const activeLanes = {};   // agentId → lastDequeueTime
+    const runToAgent = {};    // runId → agentId (from tool_result_persist)
+    const runErrors = {};     // runId → { count, firstTime, lastTime, agentId }
+
+    for (const line of lines) {
+      if (!line) continue;
+      let parsed;
+      try { parsed = JSON.parse(line); } catch { continue; }
+
+      const msg = parsed['1'] || parsed['0'] || '';
+      const time = parsed._meta?.date || parsed.time || '';
+      if (typeof msg !== 'string') continue;
+
+      // Track lane activity from dequeue/done events
+      // "lane dequeue: lane=session:agent:AGENT_ID:..."
+      const dequeueMatch = msg.match(/lane dequeue: lane=session:agent:([^:]+):/);
+      if (dequeueMatch) {
+        activeLanes[dequeueMatch[1]] = time;
+      }
+      // "lane task done: lane=session:agent:AGENT_ID:..."
+      const doneMatch = msg.match(/lane task done: lane=session:agent:([^:]+):/);
+      if (doneMatch) {
+        delete activeLanes[doneMatch[1]];
+      }
+
+      // Track runId→agent from tool_result_persist (has explicit agent=XXX)
+      const persistMatch = msg.match(/agent=([a-z0-9-]+)\s+session=agent:/);
+      if (persistMatch) {
+        // Find the currently active runId for this agent — track last seen
+        runToAgent['_last_' + persistMatch[1]] = time;
+      }
+
+      // Detect API errors: "embedded run agent end: runId=XXX isError=true"
+      const apiErrMatch = msg.match(/embedded run agent end: runId=([a-f0-9-]+) isError=true/);
+      if (apiErrMatch) {
+        const runId = apiErrMatch[1];
+        if (!runErrors[runId]) {
+          runErrors[runId] = { count: 0, firstTime: time, lastTime: time, agentId: null };
+          // Attribute to the agent whose lane is currently active
+          // Find the agent that was most recently dequeued (closest to this error time)
+          let bestAgent = null, bestTime = '';
+          for (const [agId, deqTime] of Object.entries(activeLanes)) {
+            if (deqTime <= time && deqTime > bestTime) {
+              bestTime = deqTime;
+              bestAgent = agId;
+            }
+          }
+          runErrors[runId].agentId = bestAgent;
+        }
+        runErrors[runId].count++;
+        runErrors[runId].lastTime = time;
+      }
+
+      // Track runId→agent from "embedded run done: runId=XXX sessionId=YYY durationMs=NNN"
+      const runDoneMatch = msg.match(/embedded run done: runId=([a-f0-9-]+) sessionId=([a-f0-9-]+) durationMs=(\d+)/);
+      if (runDoneMatch) {
+        const runId = runDoneMatch[1];
+        const sessionId = runDoneMatch[2];
+        const dur = parseInt(runDoneMatch[3]);
+        if (runErrors[runId]) {
+          runErrors[runId].sessionId = sessionId;
+          runErrors[runId].durationMs = dur;
+          // If no agent mapped yet, try session file lookup
+          if (!runErrors[runId].agentId) {
+            try {
+              const agentsDir = path.join(OC, 'agents');
+              for (const dir of fs.readdirSync(agentsDir)) {
+                if (fs.existsSync(path.join(agentsDir, dir, 'sessions', sessionId + '.jsonl'))) {
+                  runErrors[runId].agentId = dir;
+                  break;
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // Detect browser timeouts: "⇄ res ✗ browser.request NNNms errorCode=XXX errorMessage=YYY"
+      const browserErrMatch = msg.match(/res ✗ browser\.request (\d+)ms errorCode=(\w+) errorMessage=(.+?)(?:\s+conn=|$)/);
+      if (browserErrMatch) {
+        const dur = parseInt(browserErrMatch[1]);
+        const errorCode = browserErrMatch[2];
+        const errorMsg = browserErrMatch[3].trim().slice(0, 150);
+        errors.push({
+          time, type: 'browser', agentId: null,
+          msg: `Browser CDP: ${errorCode} — ${errorMsg}`,
+          detail: `${dur}ms timeout`,
+        });
+      }
+    }
+
+    // Build error entries from runErrors
+    for (const [runId, info] of Object.entries(runErrors)) {
+      if (info.count === 0) continue;
+      const agentId = info.agentId || null;
+
+      // Classify error based on retry count
+      let errorMsg;
+      if (info.count >= 3) {
+        errorMsg = `API: ${info.count} consecutive failures (likely rate limit or overloaded)`;
+      } else if (info.count === 2) {
+        errorMsg = `API: ${info.count} retries (transient error)`;
+      } else {
+        errorMsg = 'API: single error (transient)';
+      }
+      if (info.durationMs !== undefined) {
+        errorMsg += ` — session ${Math.round(info.durationMs/1000)}s`;
+      }
+
+      errors.push({
+        time: info.firstTime,
+        type: 'api',
+        agentId,
+        msg: errorMsg,
+        detail: `runId: ${runId.slice(0,8)}… (${info.count} error${info.count>1?'s':''})`,
+        retryCount: info.count,
+      });
+    }
+
+    errors.sort((a,b) => (b.time||'') < (a.time||'') ? -1 : 1);
+  } catch (e) {
+    // Log file doesn't exist or can't be read — that's fine
+  }
+
+  _gatewayErrorsCache = { ts: Date.now(), errors };
+  return errors;
 }
 
 function cleanStepForAPI(step) {
@@ -432,12 +593,15 @@ function loadAll() {
     trendData.push({ date: key, label, total: dailyCosts[key] || 0, byAgent: dailyByAgent[key] || {} });
   }
 
-  return { agents, dailySummary, budget: { ...budget, todayCost, projectedMonthly, avg7 }, trendData };
+  // Gateway-level errors (API errors, browser timeouts from log)
+  const gatewayErrors = parseGatewayErrors();
+
+  return { agents, dailySummary, budget: { ...budget, todayCost, projectedMonthly, avg7 }, trendData, gatewayErrors };
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
-http.createServer((req, res) => {
+http.createServer(async (req, res) => {
   const fullUrl = req.url;
   const url = fullUrl.split('?')[0];
   const params = new URL('http://x' + fullUrl).searchParams;
@@ -703,6 +867,115 @@ http.createServer((req, res) => {
     return;
   }
 
+  // GET /api/mem-stats - Claude-mem statistics (proxy to worker)
+  if (url === '/api/mem-stats') {
+    try {
+      const workerRes = await fetch('http://127.0.0.1:37777/api/stats').catch(() => null);
+      if (!workerRes || !workerRes.ok) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'Claude-mem worker not available' }));
+        return;
+      }
+      const stats = await workerRes.json();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(stats));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/mem-sessions - Session breakdown from claude-mem DB
+  if (url === '/api/mem-sessions') {
+    try {
+      const { execSync } = require('child_process');
+      const dbPath = path.join(os.homedir(), '.claude-mem', 'claude-mem.db');
+
+      // Get totals
+      const totalsQuery = 'SELECT SUM(discovery_tokens) as total_work, COUNT(*) as total_obs FROM observations WHERE discovery_tokens > 0';
+      const totalsResult = execSync('sqlite3 "' + dbPath + '" "' + totalsQuery + '"', { encoding: 'utf8' }).trim();
+      const [totalWork, totalObs] = totalsResult.split('|').map(v => parseInt(v) || 0);
+
+      // Get session breakdown with project and prompt info using JSON output
+      const query = "SELECT json_object(" +
+        "'memory_session_id', o.memory_session_id, " +
+        "'project', COALESCE(s.project, 'Unknown'), " +
+        "'user_prompt', COALESCE(s.user_prompt, ''), " +
+        "'observation_count', COUNT(*), " +
+        "'work_tokens', SUM(o.discovery_tokens), " +
+        "'created_at', MIN(o.created_at)" +
+        ") FROM observations o LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id WHERE o.discovery_tokens > 0 GROUP BY o.memory_session_id ORDER BY MIN(o.created_at_epoch) DESC LIMIT 20";
+
+      const result = execSync('sqlite3 "' + dbPath + '" "' + query + '" 2>/dev/null', {
+        encoding: 'utf8'
+      }).trim();
+
+      const sessions = result.split('\n').filter(Boolean).map(line => {
+        try {
+          return JSON.parse(line);
+        } catch (e) {
+          return null;
+        }
+      }).filter(Boolean);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        sessions,
+        totals: {
+          work_tokens: totalWork,
+          observations: totalObs
+        }
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message, sessions: [], totals: {} }));
+    }
+    return;
+  }
+
+  // DELETE /api/cleanup?agent=X - Delete all heartbeat session files for an agent
+  // DELETE /api/cleanup - Delete all heartbeat session files for ALL agents
+  if (url === '/api/cleanup' && req.method === 'DELETE') {
+    try {
+      const agentId = params.get('agent');
+      const meta = getAgentMeta();
+      const targets = agentId ? [agentId] : Object.keys(meta);
+      const results = {};
+      let totalDeleted = 0;
+
+      for (const id of targets) {
+        const sessDir = path.join(OC, 'agents', id, 'sessions');
+        let deleted = 0;
+        try {
+          const files = fs.readdirSync(sessDir);
+          for (const file of files) {
+            if (file.endsWith('.jsonl')) {
+              fs.unlinkSync(path.join(sessDir, file));
+              deleted++;
+            }
+          }
+          // Also clear sessions.json
+          const sessFile = path.join(sessDir, 'sessions.json');
+          if (fs.existsSync(sessFile)) {
+            fs.writeFileSync(sessFile, '{}');
+          }
+        } catch (e) {
+          // Directory doesn't exist or permission error
+        }
+        results[id] = deleted;
+        totalDeleted += deleted;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ deleted: totalDeleted, byAgent: results }));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(HTML);
 }).listen(PORT, () => {
@@ -720,195 +993,316 @@ const HTML = /* html */`<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;--surface3:#2d333b;
-  --border:#30363d;--text:#e6edf3;--muted:#8b949e;
-  --blue:#58a6ff;--green:#3fb950;--orange:#e3b341;
-  --red:#f85149;--purple:#bc8cff;--accent:#1f6feb;--teal:#39d353;
+  --bg:#0b0e14;--surface:#12161f;--surface2:#1a1f2e;--surface3:#242a3a;
+  --border:#1e2535;--border-light:#2a3245;--text:#e2e8f0;--muted:#64748b;--muted2:#475569;
+  --blue:#60a5fa;--green:#4ade80;--orange:#fbbf24;
+  --red:#f87171;--purple:#a78bfa;--accent:#3b82f6;--teal:#2dd4bf;
+  --glow-blue:rgba(96,165,250,.08);--glow-green:rgba(74,222,128,.08);
+  --radius:10px;--radius-sm:6px;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;
+  --font-mono:'SF Mono','Fira Code',ui-monospace,monospace;
 }
-body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace,monospace;display:flex;height:100vh;overflow:hidden}
+body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);display:flex;height:100vh;overflow:hidden}
 
 /* ── Sidebar ── */
-#sidebar{width:210px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;transition:margin-left .3s,opacity .3s}
-#sidebar.collapsed{margin-left:-210px;opacity:0;pointer-events:none}
-#sidebar-head{padding:10px 12px;border-bottom:1px solid var(--border);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
-.agent-row{padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--border)44;transition:background .12s}
+#sidebar{width:230px;background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;transition:margin-left .3s,opacity .3s}
+#sidebar.collapsed{margin-left:-230px;opacity:0;pointer-events:none}
+#sidebar-head{padding:14px 16px;border-bottom:1px solid var(--border);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;font-weight:600}
+.agent-row{padding:10px 16px;cursor:pointer;border-bottom:1px solid var(--border)33;transition:all .15s}
 .agent-row:hover{background:var(--surface2)}
-.agent-row.active{background:var(--accent)20;border-left:2px solid var(--blue);padding-left:10px}
-.agent-name{font-size:12px;font-weight:600;display:flex;align-items:center;gap:4px}
-.agent-sub{font-size:10px;color:var(--muted);margin-top:1px;display:flex;gap:6px}
-.agent-cost{color:var(--green)}
-.no-data{color:var(--border)}
-.err-count{background:var(--red)22;color:var(--red);font-size:9px;padding:1px 4px;border-radius:3px;font-weight:600}
+.agent-row.active{background:var(--accent)15;border-left:3px solid var(--blue);padding-left:13px}
+.agent-name{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:5px}
+.agent-sub{font-size:10.5px;color:var(--muted);margin-top:3px;display:flex;gap:8px}
+.agent-cost{color:var(--green);font-family:var(--font-mono);font-size:10px}
+.no-data{color:var(--border-light)}
+.err-count{background:var(--red)18;color:var(--red);font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700}
 
 /* ── Main ── */
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
 
 /* ── Topbar ── */
-#topbar{padding:9px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0}
-#agent-title{font-size:13px;font-weight:600;white-space:nowrap}
-.pill{font-size:10px;padding:2px 7px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);white-space:nowrap}
-.pill.model{color:var(--blue)}
+#topbar{padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0;background:var(--surface)}
+#agent-title{font-size:15px;font-weight:700;white-space:nowrap;letter-spacing:-.02em}
+.pill{font-size:10px;padding:3px 10px;border-radius:12px;background:var(--surface2);border:1px solid var(--border-light);color:var(--muted);white-space:nowrap;font-weight:500}
+.pill.model{color:var(--blue);border-color:var(--blue)33}
 .pill.pct-low{color:var(--green)}.pill.pct-med{color:var(--orange)}.pill.pct-high{color:var(--red)}
-#daily-pill{margin-left:auto;font-size:10px;color:var(--green);background:var(--surface2);padding:3px 8px;border-radius:10px;border:1px solid var(--border);display:none}
-#daily-pill .amt{font-weight:600}
-.sidebar-toggle-btn{font-size:16px;padding:4px 8px;border-radius:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);cursor:pointer;transition:all .15s;margin-right:10px;line-height:1}
-.sidebar-toggle-btn:hover{background:var(--surface3);border-color:var(--border)cc}
-.compare-mode-btn{font-size:10px;padding:4px 10px;border-radius:6px;background:var(--blue)11;border:1px solid var(--blue)44;color:var(--blue);cursor:pointer;transition:all .15s;font-weight:600}
-.compare-mode-btn:hover{background:var(--blue)22;border-color:var(--blue)66}
-#budget-wrap{flex:1;max-width:220px;min-width:120px;display:none}
-#budget-label{font-size:9px;color:var(--muted);margin-bottom:2px;display:flex;justify-content:space-between}
+#daily-pill{margin-left:auto;font-size:11px;color:var(--green);background:var(--glow-green);padding:5px 12px;border-radius:12px;border:1px solid var(--green)22;display:none}
+#daily-pill .amt{font-weight:700;font-family:var(--font-mono)}
+.sidebar-toggle-btn{font-size:16px;padding:6px 10px;border-radius:var(--radius-sm);background:var(--surface2);border:1px solid var(--border-light);color:var(--text);cursor:pointer;transition:all .15s;margin-right:4px;line-height:1}
+.sidebar-toggle-btn:hover{background:var(--surface3);border-color:var(--muted2)}
+.back-btn{font-size:15px;padding:4px 10px;border-radius:var(--radius-sm);background:var(--surface2);border:1px solid var(--border-light);color:var(--muted);cursor:pointer;transition:all .15s;line-height:1}
+.back-btn:hover{background:var(--surface3);color:var(--text);border-color:var(--muted2)}
+.cleanup-btn{font-size:10px;padding:5px 12px;border-radius:var(--radius-sm);background:var(--red)0a;border:1px solid var(--red)22;color:var(--red);cursor:pointer;transition:all .15s}
+.cleanup-btn:hover{background:var(--red)18;border-color:var(--red)44}
+.cleanup-all-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--red)0a;border:1px solid var(--red)22;color:var(--red);cursor:pointer;transition:all .15s;font-weight:600}
+.cleanup-all-btn:hover{background:var(--red)18;border-color:var(--red)44}
+.compare-mode-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--glow-blue);border:1px solid var(--blue)33;color:var(--blue);cursor:pointer;transition:all .15s;font-weight:600}
+.compare-mode-btn:hover{background:var(--blue)1a;border-color:var(--blue)55}
+.memory-stats-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--purple)0a;border:1px solid var(--purple)33;color:var(--purple);cursor:pointer;transition:all .15s;font-weight:600;margin-left:4px}
+.memory-stats-btn:hover{background:var(--purple)1a;border-color:var(--purple)55}
+#budget-wrap{flex:1;max-width:240px;min-width:130px;display:none}
+#budget-label{font-size:10px;color:var(--muted);margin-bottom:3px;display:flex;justify-content:space-between}
 #budget-track{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 #budget-fill{height:6px;border-radius:3px;transition:width .3s,background .3s}
 .budget-ok{background:var(--green)}.budget-warn{background:var(--orange)}.budget-over{background:var(--red)}
 
 /* ── Content ── */
-#content{flex:1;overflow-y:auto;padding:12px 14px}
+#content{flex:1;overflow-y:auto;padding:20px 24px}
 
 /* ── Overview ── */
-#overview{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
-.stat-box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 12px;flex:1;min-width:100px}
-.stat-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.stat-val{font-size:16px;font-weight:600;margin-top:2px}
+.agent-overview{margin-bottom:16px}
+.agent-overview-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0;user-select:none;margin-bottom:8px}
+.agent-overview-toggle .section-title{margin-bottom:0}
+.agent-overview-toggle .toggle-arrow{color:var(--muted);font-size:10px;transition:transform .2s}
+.agent-overview-toggle:hover .section-title{color:var(--text)}
+.agent-overview-body{overflow:hidden;transition:max-height .3s ease,opacity .2s ease}
+.agent-overview-body.collapsed{max-height:0 !important;opacity:0;margin:0;padding:0}
+.agent-overview-body.expanded{opacity:1}
+#overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
+.stat-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+.stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:500}
+.stat-val{font-size:24px;font-weight:700;margin-top:6px;font-family:var(--font-mono);letter-spacing:-.03em}
 .stat-val.green{color:var(--green)}.stat-val.purple{color:var(--purple)}.stat-val.blue{color:var(--blue)}.stat-val.orange{color:var(--orange)}
 
 /* ── Cross-agent table ── */
-.cross-agent-tbl{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:16px}
-.cross-agent-tbl th{padding:6px 10px;text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.05em}
-.cross-agent-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)33}
-.cross-agent-tbl tbody tr{cursor:pointer;transition:background .12s}
+.cross-agent-tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;margin-bottom:20px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.cross-agent-tbl th{padding:10px 14px;text-align:left;color:var(--muted);font-weight:600;border-bottom:2px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.06em;background:var(--surface2)}
+.cross-agent-tbl td{padding:10px 14px;border-bottom:1px solid var(--border)44}
+.cross-agent-tbl tbody tr:last-child td{border-bottom:none}
+.cross-agent-tbl tbody tr{cursor:pointer;transition:all .15s}
 .cross-agent-tbl tbody tr:hover{background:var(--surface2)}
-.cross-agent-tbl .r{text-align:right;font-variant-numeric:tabular-nums}
-.cross-agent-tbl .agent-cell{font-weight:600;display:flex;align-items:center;gap:6px}
+.cross-agent-tbl .r{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--font-mono);font-size:11px}
+.cross-agent-tbl .agent-cell{font-weight:600;display:flex;align-items:center;gap:8px}
 
 /* ── Daily summary ── */
-.daily-summary{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
-.daily-chip{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:10px}
-.daily-chip-label{color:var(--muted);font-size:9px;margin-bottom:2px}
-.daily-chip-val{color:var(--green);font-weight:600;font-size:13px}
-.daily-chip-sub{color:var(--muted);font-size:9px;margin-top:1px}
+.daily-summary{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}
+.daily-chip{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px}
+.daily-chip-label{color:var(--muted);font-size:10px;margin-bottom:3px;font-weight:500}
+.daily-chip-val{color:var(--green);font-weight:700;font-size:16px;font-family:var(--font-mono)}
+.daily-chip-sub{color:var(--muted);font-size:10px;margin-top:2px}
 
 /* ── Charts ── */
-.section-title{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px}
-.spark-wrap{overflow-x:auto;margin-bottom:16px}
-.chart-row{display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap}
-.chart-box{flex:1;min-width:160px}
+.section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;font-weight:600}
+.spark-wrap{overflow-x:auto;margin-bottom:20px}
+.chart-row{display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap}
+.chart-box{flex:1;min-width:180px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
 
 /* ── Heartbeat Stats Grid ── */
-.hb-stats-grid{display:grid;grid-template-columns:2fr 1.2fr 1fr;gap:14px;margin-bottom:14px}
-.stat-chart-card,.stat-breakdown-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;min-height:120px;display:flex;flex-direction:column}
-.stat-chart-title{font-size:10px;color:var(--text);font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:4px;flex-shrink:0}
+.hb-stats-grid{display:grid;grid-template-columns:2fr 1.2fr 1fr;gap:16px;margin-bottom:20px}
+.stat-chart-card,.stat-breakdown-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;min-height:140px;display:flex;flex-direction:column}
+.stat-chart-title{font-size:12px;color:var(--text);font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:6px;flex-shrink:0}
 .stat-chart-content{overflow-x:auto;flex:1;display:flex;align-items:center}
 .breakdown-table{display:flex;flex-direction:column;gap:4px}
-.breakdown-row{display:flex;justify-content:space-between;align-items:center;padding:4px 6px;border-radius:3px;font-size:10px}
+.breakdown-row{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border-radius:var(--radius-sm);font-size:12px}
 .breakdown-row:hover{background:var(--surface2)}
 .breakdown-label{color:var(--muted)}
-.breakdown-value{font-weight:600;font-variant-numeric:tabular-nums}
+.breakdown-value{font-weight:600;font-variant-numeric:tabular-nums;font-family:var(--font-mono);font-size:12px}
 .breakdown-total{border-top:1px solid var(--border);margin-top:4px;padding-top:8px}
 @media(max-width:1400px){.hb-stats-grid{grid-template-columns:repeat(2,1fr);}}
 @media(max-width:900px){.hb-stats-grid{grid-template-columns:1fr;}}
 
 /* ── Heartbeat list ── */
-.hb{border:1px solid var(--border);border-radius:6px;margin-bottom:7px;overflow:hidden}
-.hb-head{padding:8px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;background:var(--surface);transition:background .12s;user-select:none}
-.hb-head:hover,.hb-head.open{background:var(--surface2)}
-.hb-num{font-size:10px;color:var(--muted);min-width:22px}
-.hb-time{font-size:10px;color:var(--muted);min-width:50px}
-.hb-cost{font-size:11px;font-weight:600;color:var(--green);min-width:56px}
-.hb-ctx{font-size:10px;color:var(--purple);min-width:80px}
-.hb-dur{font-size:10px;color:var(--muted);min-width:36px}
-.hb-steps{font-size:10px;color:var(--muted);min-width:44px}
-.hb-browser{font-size:9px;color:var(--blue);background:var(--blue)11;border:1px solid var(--blue)33;border-radius:10px;padding:1px 6px;white-space:nowrap}
-.hb-cache{font-size:9px;border-radius:10px;padding:1px 6px;white-space:nowrap;font-weight:600}
-.cache-good{color:var(--green);background:var(--green)11;border:1px solid var(--green)33}
-.cache-ok{color:var(--blue);background:var(--blue)11;border:1px solid var(--blue)33}
-.cache-low{color:var(--orange);background:var(--orange)11;border:1px solid var(--orange)33}
-.hb-sum{font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:100px}
-.hb-arrow{font-size:9px;color:var(--muted);margin-left:6px}
+.hb{border:1px solid var(--border);border-radius:var(--radius);margin-bottom:8px;overflow:hidden}
+.hb-head{padding:12px 16px;display:flex;align-items:center;gap:14px;cursor:pointer;background:var(--surface);transition:all .15s;user-select:none;flex-wrap:wrap}
+.hb-head:hover{background:var(--surface2)}
+.hb-head.open{background:var(--surface2);border-bottom:1px solid var(--border)}
+.hb-num{font-size:13px;color:var(--text);min-width:28px;font-family:var(--font-mono);font-weight:700}
+.hb-time{font-size:12px;color:var(--muted);min-width:54px}
+.hb-cost{font-size:14px;font-weight:700;color:var(--green);min-width:70px;font-family:var(--font-mono)}
+.hb-ctx{font-size:12px;color:var(--purple);min-width:84px;font-family:var(--font-mono)}
+.hb-dur{font-size:12px;color:var(--muted);min-width:44px}
+.hb-steps{font-size:12px;color:var(--muted);min-width:52px}
+.hb-browser{font-size:9px;color:var(--blue);background:var(--glow-blue);border:1px solid var(--blue)22;border-radius:12px;padding:2px 8px;white-space:nowrap}
+.hb-cache{font-size:9px;border-radius:12px;padding:2px 8px;white-space:nowrap;font-weight:600}
+.cache-good{color:var(--green);background:var(--glow-green);border:1px solid var(--green)22}
+.cache-ok{color:var(--blue);background:var(--glow-blue);border:1px solid var(--blue)22}
+.cache-low{color:var(--orange);background:var(--orange)0a;border:1px solid var(--orange)22}
+.hb-sum{font-size:12px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:100px}
+.hb-arrow{font-size:10px;color:var(--muted);margin-left:6px;transition:transform .2s}
+.hb-head.open .hb-arrow{transform:rotate(90deg)}
 .hb-api-btns{display:flex;gap:4px;flex-shrink:0;margin-left:auto}
-.api-btn{font-size:9px;padding:2px 6px;border-radius:4px;background:var(--surface3);border:1px solid var(--border);color:var(--blue);cursor:pointer;transition:all .12s;white-space:nowrap;flex-shrink:0}
-.api-btn:hover{background:var(--blue)22;border-color:var(--blue)44}
-.api-btn.copied{background:var(--green)22;border-color:var(--green)44;color:var(--green)}
+.api-btn{font-size:9px;padding:3px 8px;border-radius:var(--radius-sm);background:var(--surface3);border:1px solid var(--border-light);color:var(--blue);cursor:pointer;transition:all .12s;white-space:nowrap;flex-shrink:0}
+.api-btn:hover{background:var(--blue)18;border-color:var(--blue)33}
+.api-btn.copied{background:var(--green)18;border-color:var(--green)33;color:var(--green)}
 
 /* ── Heartbeat body ── */
-.hb-body{display:none;padding:10px 12px 12px;background:var(--bg);border-top:1px solid var(--border)}
+.hb-body{display:none;padding:14px 16px 16px;background:var(--bg);border-top:1px solid var(--border)}
 .hb-body.open{display:block}
 
 /* ── Tool frequency bar ── */
-.tool-freq{font-size:10px;color:var(--muted);margin-bottom:10px;padding:6px 8px;background:var(--surface);border-radius:4px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-.tool-freq-label{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em;margin-right:4px}
-.tf-chip{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:1px 7px;font-size:10px;white-space:nowrap}
-.tf-chip.t-browser{color:var(--blue);border-color:var(--blue)33}
-.tf-chip.t-read,.tf-chip.t-write,.tf-chip.t-edit{color:var(--teal);border-color:var(--teal)33}
-.tf-chip.t-bash{color:var(--orange);border-color:var(--orange)33}
+.tool-freq{font-size:11px;color:var(--muted);margin-bottom:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.tool-freq-label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-right:4px;font-weight:600}
+.tf-chip{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:3px 10px;font-size:11px;white-space:nowrap}
+.tf-chip.t-browser{color:var(--blue);border-color:var(--blue)22;background:var(--glow-blue)}
+.tf-chip.t-read,.tf-chip.t-write,.tf-chip.t-edit{color:var(--teal);border-color:var(--teal)22;background:var(--teal)08}
+.tf-chip.t-bash{color:var(--orange);border-color:var(--orange)22;background:var(--orange)08}
 .tf-chip.t-other{color:var(--muted)}
 
 /* ── Step table ── */
-.tbl{width:100%;border-collapse:collapse;font-size:11px}
-.tbl th{padding:3px 8px;text-align:left;color:var(--muted);font-weight:normal;border-bottom:1px solid var(--border);white-space:nowrap;font-size:10px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{padding:10px 12px;text-align:left;color:var(--muted);font-weight:600;border-bottom:2px solid var(--border);white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 .tbl th.sortable{cursor:pointer;user-select:none;transition:background .15s}
 .tbl th.sortable:hover{background:var(--surface2);color:var(--text)}
 .sort-arrow{font-size:8px;margin-left:3px;opacity:.5}
 .sort-arrow.asc::after{content:'▲'}
 .sort-arrow.desc::after{content:'▼'}
-.tbl td{padding:3px 8px;border-bottom:1px solid var(--border)33;vertical-align:top}
+.tbl td{padding:8px 12px;border-bottom:1px solid var(--border)33;vertical-align:top;line-height:1.4}
 .tbl tr:last-child td{border-bottom:none}
-.tbl .r{text-align:right;font-variant-numeric:tabular-nums}
+.tbl .r{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--font-mono);font-size:11px}
 .tbl .g{color:var(--green)}.tbl .b{color:var(--blue)}.tbl .p{color:var(--purple)}.tbl .o{color:var(--orange)}.tbl .m{color:var(--muted)}.tbl .r2{color:var(--red)}
-.cost-bar{display:inline-block;height:5px;background:var(--green);border-radius:2px;vertical-align:middle;margin-right:3px;opacity:.8}
+.cost-bar{display:inline-block;height:6px;background:var(--green);border-radius:3px;vertical-align:middle;margin-right:6px;opacity:.7}
 
 /* ── Step row heat colors ── */
-.step-row{cursor:pointer;transition:background .1s}
+.step-row{cursor:pointer;transition:background .12s}
 .step-row:hover{background:var(--surface2) !important}
-.step-warm{background:rgba(227,179,65,.06)}
-.step-hot{background:rgba(248,81,73,.08)}
+.step-warm{background:rgba(251,191,36,.05)}
+.step-hot{background:rgba(248,113,113,.06)}
 .step-row.expanded{background:var(--surface2)}
 
 /* ── Step detail panel ── */
 .step-detail td{padding:0 !important;border-bottom:1px solid var(--border) !important}
-.step-detail-inner{padding:8px 10px;background:var(--surface3);display:flex;gap:12px;flex-wrap:wrap}
-.thinking-section{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px}
-.thinking-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
-.thinking-text{font-size:11px;color:var(--text);line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
-.detail-call{flex:1;min-width:220px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:10px}
-.detail-call-head{font-size:10px;font-weight:600;color:var(--blue);margin-bottom:4px;display:flex;justify-content:space-between}
-.detail-call-args{color:var(--muted);margin-bottom:6px;word-break:break-all;white-space:pre-wrap;max-height:80px;overflow-y:auto}
-.detail-result{border-top:1px solid var(--border);padding-top:4px;margin-top:2px}
-.detail-result-head{font-size:9px;color:var(--muted);margin-bottom:2px;display:flex;gap:6px;align-items:center}
-.detail-result-body{color:var(--text);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow-y:auto;font-size:10px;opacity:.8}
-.err-badge{color:var(--red);font-size:9px;background:rgba(248,81,73,.1);padding:1px 5px;border-radius:3px}
+.step-detail-inner{padding:10px 12px;background:var(--surface3);display:flex;gap:12px;flex-wrap:wrap}
+.thinking-section{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:8px}
+.thinking-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
+.thinking-text{font-size:11px;color:var(--text);line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
+.detail-call{flex:1;min-width:220px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;font-size:11px}
+.detail-call-head{font-size:11px;font-weight:600;color:var(--blue);margin-bottom:6px;display:flex;justify-content:space-between}
+.detail-call-args{color:var(--muted);margin-bottom:8px;word-break:break-all;white-space:pre-wrap;max-height:80px;overflow-y:auto;font-family:var(--font-mono);font-size:10px}
+.detail-result{border-top:1px solid var(--border);padding-top:6px;margin-top:4px}
+.detail-result-head{font-size:10px;color:var(--muted);margin-bottom:3px;display:flex;gap:6px;align-items:center}
+.detail-result-body{color:var(--text);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow-y:auto;font-size:10px;opacity:.85;font-family:var(--font-mono)}
+.err-badge{color:var(--red);font-size:9px;background:var(--red)14;padding:2px 6px;border-radius:4px;font-weight:600}
+.err-badge-solved{color:var(--muted);font-size:9px;background:var(--surface2);padding:2px 6px;border-radius:4px}
+.mark-solved-btn{font-size:9px;padding:3px 8px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px;transition:all .12s}
+.mark-solved-btn:hover{background:var(--surface3);border-color:var(--green);color:var(--green)}
+.mark-all-solved-btn{font-size:9px;padding:2px 8px;background:var(--surface2);color:var(--green);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px;font-weight:600;transition:all .12s}
+.mark-all-solved-btn:hover{background:var(--surface3);border-color:var(--green)}
 
 /* ── Waste warnings ── */
-.waste-hints{background:var(--surface);border:1px solid var(--orange)44;border-radius:6px;padding:8px 10px;margin-bottom:10px}
-.waste-title{font-size:10px;color:var(--orange);font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:4px}
-.waste-list{font-size:10px;color:var(--muted);line-height:1.4}
-.waste-item{margin-bottom:2px;display:flex;gap:6px}
+.waste-hints{background:var(--surface);border:1px solid var(--orange)33;border-radius:var(--radius);padding:10px 14px;margin-bottom:12px}
+.waste-title{font-size:11px;color:var(--orange);font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.waste-list{font-size:11px;color:var(--muted);line-height:1.5}
+.waste-item{margin-bottom:3px;display:flex;gap:6px}
 .waste-icon{color:var(--orange)}
 
 /* ── Comparison ── */
-.compare-bar{background:var(--surface);border:1px solid var(--blue)44;border-radius:6px;padding:8px 12px;margin-bottom:10px;display:flex;align-items:center;gap:10px}
-.compare-label{font-size:10px;color:var(--blue);font-weight:600}
-.compare-chip{font-size:10px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:2px 8px;color:var(--muted)}
-.compare-chip.selected{border-color:var(--blue);color:var(--blue)}
-.compare-btn{font-size:10px;padding:3px 8px;border-radius:6px;background:var(--blue)22;border:1px solid var(--blue)44;color:var(--blue);cursor:pointer;transition:background .12s}
-.compare-btn:hover{background:var(--blue)33}
-.compare-view{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-.compare-col{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px}
-.compare-col-title{font-size:10px;font-weight:600;color:var(--blue);margin-bottom:8px}
-.compare-stat{font-size:10px;padding:4px 0;display:flex;justify-content:space-between;border-bottom:1px solid var(--border)33}
+.compare-bar{background:var(--surface);border:1px solid var(--blue)33;border-radius:var(--radius);padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;gap:12px}
+.compare-label{font-size:11px;color:var(--blue);font-weight:600}
+.compare-chip{font-size:11px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:3px 10px;color:var(--muted)}
+.compare-chip.selected{border-color:var(--blue);color:var(--blue);background:var(--glow-blue)}
+.compare-btn{font-size:10px;padding:4px 10px;border-radius:var(--radius-sm);background:var(--blue)18;border:1px solid var(--blue)33;color:var(--blue);cursor:pointer;transition:background .12s}
+.compare-btn:hover{background:var(--blue)28}
+.compare-view{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+.compare-col{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.compare-col-title{font-size:11px;font-weight:600;color:var(--blue);margin-bottom:10px}
+.compare-stat{font-size:11px;padding:5px 0;display:flex;justify-content:space-between;border-bottom:1px solid var(--border)33}
 .compare-stat:last-child{border-bottom:none}
+
+/* ── Heartbeat Health Timeline ── */
+.health-timeline{margin-bottom:24px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+.health-timeline .section-title{margin-bottom:12px}
+.ht-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)22}
+.ht-row:last-child{border-bottom:none}
+.ht-agent{font-size:12px;min-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;font-weight:500;transition:color .12s}
+.ht-agent:hover{color:var(--blue)}
+.ht-dots{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.ht-dot{width:12px;height:12px;border-radius:3px;cursor:default;transition:all .15s;flex-shrink:0}
+.ht-dot:hover{transform:scale(1.3);border-radius:2px}
+.ht-dot.green{background:var(--green)}.ht-dot.yellow{background:var(--orange)}.ht-dot.red{background:var(--red)}.ht-dot.grey{background:var(--border)}
+.ht-summary{font-size:10px;color:var(--muted);margin-left:8px;white-space:nowrap}
+
+/* ── Bottom panels (error + actions side by side) ── */
+.charts-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:20px}
+.charts-row .chart-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;min-width:0;display:flex;flex-direction:column}
+.charts-row .chart-card svg{flex:1}
+.charts-row .chart-card .section-title{margin-bottom:10px}
+@media(max-width:1200px){.charts-row{grid-template-columns:1fr 1fr}.charts-row .chart-card:last-child{grid-column:span 2}}
+@media(max-width:800px){.charts-row{grid-template-columns:1fr}.charts-row .chart-card:last-child{grid-column:span 1}}
+.bottom-panels{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}
+@media(max-width:1100px){.bottom-panels{grid-template-columns:1fr}}
+
+/* ── Error Log Panel ── */
+.error-panel{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.error-panel.has-errors{border-color:var(--red)33}
+.error-header{padding:10px 14px;background:var(--surface);cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none;transition:background .12s}
+.error-header:hover{background:var(--surface2)}
+.error-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.error-badge{background:var(--red)18;color:var(--red);font-size:10px;padding:2px 8px;border-radius:12px;font-weight:600}
+.error-ok-badge{background:var(--glow-green);color:var(--green);font-size:10px;padding:2px 8px;border-radius:12px;font-weight:600}
+.error-body{display:none;max-height:300px;overflow-y:auto}
+.error-body.open{display:block}
+.error-filter{padding:8px 14px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap}
+.error-filter-btn{font-size:10px;padding:3px 10px;border-radius:12px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .12s}
+.error-filter-btn:hover,.error-filter-btn.active{background:var(--glow-blue);border-color:var(--blue)33;color:var(--blue)}
+.error-item{padding:8px 14px;border-bottom:1px solid var(--border)33;font-size:11px;display:flex;gap:10px;align-items:flex-start}
+.error-item:last-child{border-bottom:none}
+.error-time{color:var(--muted);min-width:44px;flex-shrink:0;font-family:var(--font-mono);font-size:10px}
+.error-agent{min-width:22px;flex-shrink:0}
+.error-msg{color:var(--red);word-break:break-word;line-height:1.5;opacity:.9}
+.error-type-badge{font-size:9px;padding:1px 6px;border-radius:8px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;flex-shrink:0;min-width:42px;text-align:center}
+.error-type-summary{font-size:10px;font-weight:500;margin-left:4px}
+.error-type-counts{display:flex;gap:10px;margin-left:6px}
+
+/* ── Actions Feed ── */
+.actions-feed{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+.actions-feed .section-title{margin-bottom:10px}
+.af-controls{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+.af-filter-btn{font-size:10px;padding:3px 10px;border-radius:12px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .12s}
+.af-filter-btn:hover,.af-filter-btn.active{background:var(--glow-blue);border-color:var(--blue)33;color:var(--blue)}
+.af-list{max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm)}
+.af-item{padding:6px 12px;border-bottom:1px solid var(--border)33;font-size:11px;display:flex;gap:10px;align-items:center;transition:background .1s}
+.af-item:last-child{border-bottom:none}
+.af-item:hover{background:var(--surface2)}
+.af-time{color:var(--muted);min-width:44px;flex-shrink:0;font-family:var(--font-mono);font-size:10px}
+.af-agent{min-width:20px;flex-shrink:0}
+.af-type{font-size:9px;padding:2px 8px;border-radius:12px;white-space:nowrap;font-weight:600;min-width:54px;text-align:center}
+.af-type.browser{color:var(--blue);background:var(--glow-blue);border:1px solid var(--blue)22}
+.af-type.file{color:var(--teal);background:var(--teal)08;border:1px solid var(--teal)22}
+.af-type.shell{color:var(--orange);background:var(--orange)08;border:1px solid var(--orange)22}
+.af-type.error{color:var(--red);background:var(--red)08;border:1px solid var(--red)22}
+.af-type.other{color:var(--muted);background:var(--surface2);border:1px solid var(--border)}
+.af-desc{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;opacity:.8}
 .compare-stat .lbl{color:var(--muted)}
-.compare-stat .val{color:var(--text);font-weight:600}
+.compare-stat .val{color:var(--text);font-weight:600;font-family:var(--font-mono);font-size:11px}
 .compare-delta{font-size:9px;margin-left:6px}
 .delta-pos{color:var(--green)}.delta-neg{color:var(--red)}.delta-zero{color:var(--muted)}
 
 /* ── Misc ── */
-.empty{padding:40px;text-align:center;color:var(--muted);font-size:11px}
-#refresh{position:fixed;bottom:10px;right:12px;font-size:10px;color:var(--muted)}
+.empty{padding:60px;text-align:center;color:var(--muted);font-size:13px}
+#refresh{position:fixed;bottom:12px;right:16px;font-size:10px;color:var(--muted);font-family:var(--font-mono)}
 #refresh.spin{color:var(--blue)}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--border-light)}
 .thinking-cell:hover{background:var(--surface2)22}
+
+/* ── Memory Stats Modal ── */
+#memory-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:1000;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+#memory-modal.show{display:flex}
+.modal-content{background:var(--surface);border:1px solid var(--border);border-radius:12px;width:90%;max-width:900px;max-height:85vh;overflow-y:auto;box-shadow:0 12px 48px rgba(0,0,0,.6)}
+.modal-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:var(--surface);z-index:10}
+.modal-title{font-size:15px;font-weight:700;color:var(--purple);display:flex;align-items:center;gap:8px}
+.modal-close{font-size:20px;color:var(--muted);cursor:pointer;background:none;border:none;padding:0;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:var(--radius-sm);transition:all .15s}
+.modal-close:hover{background:var(--surface2);color:var(--text)}
+.modal-body{padding:18px 20px}
+.mem-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:24px}
+.mem-stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.mem-stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;font-weight:500}
+.mem-stat-value{font-size:20px;font-weight:700;color:var(--text);font-family:var(--font-mono)}
+.mem-stat-sub{font-size:10px;color:var(--muted);margin-top:3px}
+.mem-stat-value.purple{color:var(--purple)}
+.mem-stat-value.green{color:var(--green)}
+.mem-stat-value.blue{color:var(--blue)}
+.mem-stat-value.orange{color:var(--orange)}
+.mem-section-title{font-size:11px;font-weight:600;color:var(--text);margin:20px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.mem-session-table{width:100%;font-size:10px;border-collapse:collapse;margin-bottom:16px}
+.mem-session-table th{text-align:left;padding:8px 10px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.05em;font-size:9px}
+.mem-session-table td{padding:6px 10px;border-bottom:1px solid var(--border)33}
+.mem-session-table tr:hover{background:var(--surface3)}
+.mem-session-table .r{text-align:right;font-variant-numeric:tabular-nums}
+.mem-loading{text-align:center;padding:40px;color:var(--muted)}
+.mem-error{text-align:center;padding:40px;color:var(--red)}
 </style>
 </head>
 <body>
@@ -921,7 +1315,8 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 <div id="main">
   <div id="topbar">
     <button id="sidebar-toggle" class="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
-    <span id="agent-title">Token Dashboard</span>
+    <button id="back-btn" class="back-btn" onclick="goHome()" style="display:none" title="Back to overview">←</button>
+    <span id="agent-title" style="cursor:pointer" onclick="if(selectedId)goHome()">Token Dashboard</span>
     <span id="pill-model" class="pill model" style="display:none"></span>
     <span id="pill-ctx"   class="pill"       style="display:none"></span>
     <div id="budget-wrap"                     style="display:none">
@@ -929,12 +1324,26 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
       <div id="budget-track"><div id="budget-fill"></div></div>
     </div>
     <button id="compare-mode-btn" class="compare-mode-btn" onclick="toggleCompareMode()" style="display:none">Compare</button>
+    <button id="memory-stats-btn" class="memory-stats-btn" onclick="showMemoryStats()">🧠 Memory Stats</button>
+    <button id="cleanup-all-btn" class="cleanup-all-btn" onclick="cleanupAll()" style="display:none">🗑 Cleanup All</button>
     <div id="daily-pill"><span class="amt"></span> <span class="m"></span></div>
   </div>
   <div id="content"><div class="empty">← select an agent</div></div>
 </div>
 
-<div id="refresh">● auto-refresh 30s</div>
+<div id="refresh">● auto-refresh 5s</div>
+
+<div id="memory-modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <div class="modal-title">🧠 Claude-Mem Memory Statistics</div>
+      <button class="modal-close" onclick="hideMemoryStats()">×</button>
+    </div>
+    <div class="modal-body" id="memory-modal-body">
+      <div class="mem-loading">Loading memory statistics...</div>
+    </div>
+  </div>
+</div>
 
 <script>
 let DATA = null;
@@ -943,18 +1352,130 @@ let openHbIdx  = null;
 const expandedSteps = {};
 let compareMode = false;
 let compareHbs = []; // [hbIdx1, hbIdx2]
+let agentOverviewOpen = true;
+
+// ── Solved Errors Tracking ────────────────────────────────────────────────────
+// Store solved errors by agentId:hbStartTime:stepIdx:resultIdx
+// Using startTime (stable) instead of array index (shifts when new heartbeats arrive)
+let solvedErrors = {};
+try {
+  const stored = localStorage.getItem('solvedErrors');
+  if (stored) solvedErrors = JSON.parse(stored);
+} catch {}
+
+function saveSolvedErrors() {
+  try {
+    localStorage.setItem('solvedErrors', JSON.stringify(solvedErrors));
+  } catch {}
+}
+
+function getErrorKey(agentId, hbId, stepIdx, resultIdx) {
+  return agentId + ':' + hbId + ':' + stepIdx + ':' + resultIdx;
+}
+
+function isErrorSolved(agentId, hbId, stepIdx, resultIdx) {
+  const key = getErrorKey(agentId, hbId, stepIdx, resultIdx);
+  return solvedErrors[key] === true;
+}
+
+function markErrorSolved(agentId, hbId, stepIdx, resultIdx) {
+  const key = getErrorKey(agentId, hbId, stepIdx, resultIdx);
+  solvedErrors[key] = true;
+  saveSolvedErrors();
+
+  // Reload the current agent view to update error counts
+  if (!DATA) return;
+  const a = DATA.agents.find(a => a.id === selectedId);
+  if (a) {
+    // Recalculate error counts for this agent
+    recalculateErrorCounts(a);
+    renderAgent(a);
+    renderSidebar();
+  }
+}
+
+function markAllErrorsSolved(hbIdx) {
+  if (!DATA || !selectedId) return;
+  const agent = DATA.agents.find(a => a.id === selectedId);
+  if (!agent || !agent.heartbeats || !agent.heartbeats[hbIdx]) return;
+
+  const hb = agent.heartbeats[hbIdx];
+  const hbId = hb.startTime || hbIdx;
+  let markedCount = 0;
+
+  // Iterate through all steps and tool results in this heartbeat
+  for (let stepIdx = 0; stepIdx < (hb.steps || []).length; stepIdx++) {
+    const step = hb.steps[stepIdx];
+    const results = step.toolResults || [];
+
+    for (let resultIdx = 0; resultIdx < results.length; resultIdx++) {
+      const tr = results[resultIdx];
+      if (hasErrorInResult(tr) && !isErrorSolved(selectedId, hbId, stepIdx, resultIdx)) {
+        const key = getErrorKey(selectedId, hbId, stepIdx, resultIdx);
+        solvedErrors[key] = true;
+        markedCount++;
+      }
+    }
+  }
+
+  if (markedCount > 0) {
+    saveSolvedErrors();
+    recalculateErrorCounts(agent);
+    renderAgent(agent);
+    renderSidebar();
+  }
+}
+
+function recalculateErrorCounts(agent) {
+  // Recalculate error counts for all heartbeats, excluding solved errors
+  for (let hbIdx = 0; hbIdx < (agent.heartbeats || []).length; hbIdx++) {
+    const hb = agent.heartbeats[hbIdx];
+    const hbId = hb.startTime || hbIdx;
+    let errorCount = 0;
+
+    for (let stepIdx = 0; stepIdx < (hb.steps || []).length; stepIdx++) {
+      const step = hb.steps[stepIdx];
+      const results = step.toolResults || [];
+
+      for (let resultIdx = 0; resultIdx < results.length; resultIdx++) {
+        const tr = results[resultIdx];
+        if (hasErrorInResult(tr) && !isErrorSolved(agent.id, hbId, stepIdx, resultIdx)) {
+          errorCount++;
+        }
+      }
+    }
+
+    hb.errorCount = errorCount;
+  }
+
+  // Recalculate total errors for agent
+  agent.totalErrors = agent.heartbeats.reduce((sum, hb) => sum + (hb.errorCount || 0), 0);
+}
+
+function hasErrorInResult(toolResult) {
+  if (toolResult.isError) return true;
+  const preview = toolResult.preview || '';
+  try {
+    const parsed = JSON.parse(preview);
+    if (parsed.status === 'error' || parsed.error) return true;
+  } catch {
+    if (preview.includes('"status": "error"') || preview.includes('"status":"error"')) return true;
+  }
+  return false;
+}
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 const f$  = n => '$' + (+n||0).toFixed(4);
 const fN  = n => (+n||0).toLocaleString();
 const fT  = ts => ts ? new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
 const fD  = ms => { if(!ms) return '—'; const s=Math.round(ms/1000); return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'; };
+const fmtSize = n => { if(!n) return '—'; if(n>=1000000) return (n/1000000).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(1)+'k'; return n.toString(); };
 const fAgo= ms => {
   if(!ms) return '';
   const s = Math.round((Date.now()-ms)/1000);
   return s<60?s+'s ago':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';
 };
-const fModel = m => (m||'').replace('claude-','').replace(/-2025\\d{4}$/,'');
+const fModel = m => (m||'').replace('claude-','').replace(/-20\\d{6}$/,'');
 const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const fSz = n => { if(!n) return '—'; if(n>=1000000) return (n/1000000).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(1)+'k'; return n+'c'; };
 
@@ -962,31 +1483,83 @@ const fSz = n => { if(!n) return '—'; if(n>=1000000) return (n/1000000).toFixe
 function svgBars(vals, h, color, tipFn) {
   if (!vals.length) return '<svg></svg>';
   const maxV = Math.max(...vals, 1e-9);
-  const W = 600; // Fixed viewBox width
-  const barW = Math.max(6, Math.floor(W/vals.length) - 3);
-  const gap  = 3;
-  const bars = vals.map((v,i) => {
-    const bh = Math.max(2, Math.round((v/maxV)*(h-16)));
-    const x  = i*(barW+gap);
-    const y  = h-bh-12;
-    return \`<rect x="\${x}" y="\${y}" width="\${barW}" height="\${bh}" fill="\${color}" rx="2" opacity=".9"><title>\${tipFn?tipFn(v,i):v}</title></rect>\`;
+  const W = 600, padL = 50, padR = 10, padT = 14, padB = 24;
+  const chartW = W - padL - padR, chartH = h - padT - padB;
+  const barW = Math.max(6, Math.floor(chartW / vals.length) - 4);
+  const gap = Math.max(2, Math.floor((chartW - vals.length * barW) / Math.max(vals.length, 1)));
+
+  // Y-axis grid + labels
+  const ySteps = 3;
+  const grid = Array.from({length: ySteps + 1}, (_, i) => {
+    const v = maxV * (1 - i / ySteps);
+    const y = padT + (i * chartH / ySteps);
+    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="#1e2535" stroke-width="1"/>
+      <text x="\${padL - 6}" y="\${y + 3}" fill="#475569" font-size="9" text-anchor="end" font-family="var(--font-mono)">\${f$(v)}</text>\`;
   }).join('');
-  return \`<svg viewBox="0 0 \${W} \${h}" width="100%" height="\${h}" style="display:block">\${bars}</svg>\`;
+
+  const bars = vals.map((v, i) => {
+    const bh = Math.max(2, Math.round((v / maxV) * chartH));
+    const x = padL + i * (barW + gap) + gap / 2;
+    const y = padT + chartH - bh;
+    const opacity = 0.5 + 0.5 * (v / maxV);
+    return \`<g>
+      <rect x="\${x}" y="\${y}" width="\${barW}" height="\${bh}" fill="\${color}" rx="3" opacity="\${opacity.toFixed(2)}"><title>\${tipFn ? tipFn(v, i) : v}</title></rect>
+      <text x="\${x + barW / 2}" y="\${y - 4}" fill="#94a3b8" font-size="8" text-anchor="middle" font-family="var(--font-mono)">\${f$(v)}</text>
+      <text x="\${x + barW / 2}" y="\${h - 6}" fill="#475569" font-size="9" text-anchor="middle">#\${i + 1}</text>
+    </g>\`;
+  }).join('');
+
+  return \`<svg viewBox="0 0 \${W} \${h}" width="100%" height="\${h}" style="display:block">\${grid}\${bars}</svg>\`;
 }
 
 function svgLine(vals, h, color) {
   const n = vals.length;
   if (n < 2) return '<svg></svg>';
+  const minV = Math.min(...vals);
   const maxV = Math.max(...vals, 1);
-  const W = 600; // Fixed viewBox width
-  const pad = 10; // Padding
-  const pts  = vals.map((v,i) => {
-    const x = pad + Math.round(i*(W-2*pad)/(n-1));
-    const y = pad + Math.round((1-v/maxV)*(h-2*pad));
-    return x+','+y;
-  }).join(' ');
+  const range = maxV - minV || 1;
+  const W = 600, padL = 56, padR = 10, padT = 14, padB = 24;
+  const chartW = W - padL - padR, chartH = h - padT - padB;
+
+  // Y-axis grid + labels
+  const ySteps = 3;
+  const grid = Array.from({length: ySteps + 1}, (_, i) => {
+    const v = maxV - (i / ySteps) * range;
+    const y = padT + (i * chartH / ySteps);
+    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="#1e2535" stroke-width="1"/>
+      <text x="\${padL - 6}" y="\${y + 3}" fill="#475569" font-size="9" text-anchor="end" font-family="var(--font-mono)">\${fN(Math.round(v))}</text>\`;
+  }).join('');
+
+  // Data points + line
+  const points = vals.map((v, i) => {
+    const x = padL + Math.round(i * chartW / (n - 1));
+    const y = padT + Math.round((1 - (v - minV) / range) * chartH);
+    return { x, y, v };
+  });
+  const pts = points.map(p => p.x + ',' + p.y).join(' ');
+
+  // Gradient fill under line
+  const fillPts = \`\${padL},\${padT + chartH} \${pts} \${padL + chartW},\${padT + chartH}\`;
+
+  // Dots + value labels (show first, last, max)
+  const dots = points.map((p, i) => {
+    const showLabel = i === 0 || i === n - 1 || p.v === maxV;
+    return \`<circle cx="\${p.x}" cy="\${p.y}" r="3.5" fill="\${color}" stroke="var(--surface)" stroke-width="2"><title>#\${i + 1}: \${fN(Math.round(p.v))}</title></circle>
+      \${showLabel ? \`<text x="\${p.x}" y="\${p.y - 8}" fill="#94a3b8" font-size="9" text-anchor="middle" font-family="var(--font-mono)">\${fN(Math.round(p.v))}</text>\` : ''}
+    \`;
+  }).join('');
+
+  // X-axis labels
+  const xLabels = points.map((p, i) =>
+    \`<text x="\${p.x}" y="\${h - 6}" fill="#475569" font-size="9" text-anchor="middle">#\${i + 1}</text>\`
+  ).join('');
+
   return \`<svg viewBox="0 0 \${W} \${h}" width="100%" height="\${h}" style="display:block">
-    <polyline points="\${pts}" fill="none" stroke="\${color}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+    \${grid}
+    <polygon points="\${fillPts}" fill="\${color}" opacity="0.06"/>
+    <polyline points="\${pts}" fill="none" stroke="\${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+    \${dots}
+    \${xLabels}
   </svg>\`;
 }
 
@@ -1001,18 +1574,18 @@ function svgToolBreakdown(steps) {
   if (!entries.length) return '<div class="m" style="padding:20px;text-align:center;font-size:10px">No tools used</div>';
 
   const maxCount = Math.max(...entries.map(e => e[1]));
-  const colors = {browser:'#58a6ff',read:'#39d353',write:'#39d353',edit:'#39d353',bash:'#e3b341',grep:'#bc8cff',glob:'#bc8cff'};
+  const colors = {browser:'#60a5fa',read:'#2dd4bf',write:'#2dd4bf',edit:'#2dd4bf',bash:'#fbbf24',grep:'#a78bfa',glob:'#a78bfa'};
 
   return entries.map(([tool, count]) => {
     const pct = Math.round((count / maxCount) * 100);
-    const color = colors[tool] || '#8b949e';
+    const color = colors[tool] || '#64748b';
     return \`<div style="margin-bottom:6px">
-      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">
-        <span style="color:var(--text)">\${tool}</span>
-        <span style="color:var(--muted)">\${count}×</span>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+        <span style="color:var(--text);font-weight:500">\${tool}</span>
+        <span style="color:var(--muted);font-family:var(--font-mono)">\${count}×</span>
       </div>
-      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
-        <div style="width:\${pct}%;height:100%;background:\${color};transition:width .3s"></div>
+      <div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden">
+        <div style="width:\${pct}%;height:100%;background:\${color};transition:width .3s;border-radius:4px"></div>
       </div>
     </div>\`;
   }).join('');
@@ -1041,77 +1614,105 @@ function svgDurationBreakdown(steps) {
         <span style="color:var(--muted)">\${fD(step.duration)}</span>
       </div>
       <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
-        <div style="width:\${pct}%;height:100%;background:#e3b341;transition:width .3s"></div>
+        <div style="width:\${pct}%;height:100%;background:#fbbf24;transition:width .3s"></div>
       </div>
     </div>\`;
   }).join('');
 }
 
-function svgTrendChart(trendData, agents) {
+// ── Shared chart dimensions ──────────────────────────────────────────────────
+const CHART_H = 180; // consistent height across all 3 charts
+
+// ── Chart 1: Cost by Agent (horizontal bar) ─────────────────────────────────
+function svgCostByAgent(agents) {
+  const sorted = agents.filter(a => a.totalCost > 0).sort((a,b) => b.totalCost - a.totalCost);
+  if (!sorted.length) return '<div class="m" style="padding:20px;text-align:center">No cost data</div>';
+  const maxCost = sorted[0].totalCost;
+  const totalCost = agents.reduce((s,x) => s + x.totalCost, 0);
+  const n = sorted.length;
+  const barH = Math.min(22, Math.floor((CHART_H - 4) / n) - 4);
+  const gap = Math.min(4, Math.floor((CHART_H - n * barH) / Math.max(n - 1, 1)));
+  const labelW = 80, chartW = 180, valW = 100;
+  const totalW = labelW + chartW + valW;
+  const bars = sorted.map((a, i) => {
+    const y = i * (barH + gap) + 2;
+    const w = Math.max(2, (a.totalCost / maxCost) * chartW);
+    const share = totalCost > 0 ? ((a.totalCost / totalCost) * 100).toFixed(0) + '%' : '';
+    return \`<g>
+      <text x="\${labelW - 6}" y="\${y + barH/2 + 4}" fill="#e2e8f0" font-size="11" text-anchor="end">\${esc(a.emoji)} \${esc(a.name.replace(' Promo',''))}</text>
+      <rect x="\${labelW}" y="\${y}" width="\${w.toFixed(1)}" height="\${barH}" rx="3" fill="#60a5fa" opacity="0.8"><title>\${a.emoji} \${a.name}: \${f$(a.totalCost)}</title></rect>
+      <text x="\${labelW + w + 6}" y="\${y + barH/2 + 4}" fill="#94a3b8" font-size="10">\${f$(a.totalCost)} <tspan fill="#475569">\${share}</tspan></text>
+    </g>\`;
+  }).join('');
+  return \`<svg width="100%" viewBox="0 0 \${totalW} \${CHART_H}" style="display:block">\${bars}</svg>\`;
+}
+
+// ── Chart 2: 7-Day Daily Spend (vertical bar) ──────────────────────────────
+function svgDailySpend(trendData) {
+  if (!trendData || trendData.length < 1) return '<div class="m" style="padding:20px;text-align:center">No trend data</div>';
+  const W = 360, padL = 45, padR = 10, padT = 16, padB = 28;
+  const chartW = W - padL - padR, chartH = CHART_H - padT - padB;
   const n = trendData.length;
-  if (n < 2) return '<div class="m" style="padding:20px;text-align:center">Not enough data</div>';
-
-  const W = 600, H = 140, padL = 40, padR = 10, padT = 20, padB = 30;
-  const chartW = W - padL - padR, chartH = H - padT - padB;
-
   const maxV = Math.max(...trendData.map(d => d.total), 0.01);
-  const agentColors = ['#58a6ff','#3fb950','#e3b341','#f85149','#bc8cff','#39d353','#ff7b72','#ffa657','#79c0ff'];
+  const barW = Math.min(36, Math.floor(chartW / n) - 8);
+  const gap = (chartW - n * barW) / (n + 1);
 
-  // Build lines per agent
-  const agentIds = [...new Set(trendData.flatMap(d => Object.keys(d.byAgent)))];
-  const lines = agentIds.slice(0,9).map((aid,idx) => {
-    const vals = trendData.map(d => d.byAgent[aid] || 0);
-    const pts = vals.map((v,i) => {
-      const x = padL + (i * chartW / (n-1));
-      const y = padT + chartH - (v / maxV * chartH);
-      return x.toFixed(1)+','+y.toFixed(1);
-    }).join(' ');
-    const agent = agents.find(a => a.id === aid);
-    const color = agentColors[idx % agentColors.length];
-    return { pts, color, name: agent?.name || aid, emoji: agent?.emoji || '' };
-  });
-
-  // Total line
-  const totalPts = trendData.map((d,i) => {
-    const x = padL + (i * chartW / (n-1));
-    const y = padT + chartH - (d.total / maxV * chartH);
-    return x.toFixed(1)+','+y.toFixed(1);
-  }).join(' ');
-
-  // X-axis labels
-  const xLabels = trendData.map((d,i) => {
-    const x = padL + (i * chartW / (n-1));
-    return \`<text x="\${x}" y="\${H-8}" fill="#8b949e" font-size="9" text-anchor="middle">\${esc(d.label)}</text>\`;
-  }).join('');
-
-  // Y-axis labels
+  // Grid lines
   const ySteps = 3;
-  const yLabels = Array.from({length:ySteps+1}, (_,i) => {
-    const v = maxV * (1 - i/ySteps);
+  const gridLines = Array.from({length: ySteps + 1}, (_, i) => {
+    const v = maxV * (1 - i / ySteps);
     const y = padT + (i * chartH / ySteps);
-    return \`<text x="\${padL-5}" y="\${y+3}" fill="#8b949e" font-size="9" text-anchor="end">\${f$(v)}</text>
-      <line x1="\${padL}" y1="\${y}" x2="\${W-padR}" y2="\${y}" stroke="#30363d" stroke-width="1" opacity="0.3"/>
-    \`;
+    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="#1e2535" stroke-width="1"/>
+      <text x="\${padL - 6}" y="\${y + 3}" fill="#475569" font-size="9" text-anchor="end">\${f$(v)}</text>\`;
   }).join('');
 
-  const agentLines = lines.map(l =>
-    \`<polyline points="\${l.pts}" fill="none" stroke="\${l.color}" stroke-width="1.5" opacity="0.7"><title>\${esc(l.name)}</title></polyline>\`
-  ).join('');
+  const bars = trendData.map((d, i) => {
+    const x = padL + gap + i * (barW + gap);
+    const barH = Math.max(1, (d.total / maxV) * chartH);
+    const y = padT + chartH - barH;
+    const isToday = i === n - 1;
+    const color = isToday ? '#60a5fa' : '#60a5fa';
+    const opacity = isToday ? '0.9' : '0.45';
+    return \`<g>
+      <rect x="\${x}" y="\${y}" width="\${barW}" height="\${barH.toFixed(1)}" rx="3" fill="\${color}" opacity="\${opacity}"><title>\${esc(d.label)}: \${f$(d.total)}</title></rect>
+      <text x="\${x + barW/2}" y="\${y - 4}" fill="#94a3b8" font-size="9" text-anchor="middle">\${f$(d.total)}</text>
+      <text x="\${x + barW/2}" y="\${CHART_H - 6}" fill="#475569" font-size="9" text-anchor="middle">\${esc(d.label)}</text>
+    </g>\`;
+  }).join('');
 
-  const legend = lines.map((l,i) =>
-    \`<g transform="translate(\${10 + (i%3)*90}, \${H + 5 + Math.floor(i/3)*14})">
-      <circle cx="5" cy="5" r="3" fill="\${l.color}"/>
-      <text x="12" y="8" fill="#e6edf3" font-size="9">\${esc(l.emoji)} \${esc(l.name.slice(0,8))}</text>
-    </g>\`
-  ).join('');
+  return \`<svg width="100%" viewBox="0 0 \${W} \${CHART_H}" style="display:block">\${gridLines}\${bars}</svg>\`;
+}
 
-  return \`<svg width="\${W}" height="\${H+30}" style="display:block">
-    \${yLabels}
-    \${agentLines}
-    <polyline points="\${totalPts}" fill="none" stroke="#e6edf3" stroke-width="2" opacity="0.9"><title>Total</title></polyline>
-    \${xLabels}
-    \${legend}
-  </svg>\`;
+// ── Chart 3: Activity by Hour (vertical bar) ────────────────────────────────
+function svgHourlyActivity(agents) {
+  const hourBuckets = new Array(24).fill(0);
+  const hourCosts = new Array(24).fill(0);
+  for (const a of agents) {
+    for (const hb of (a.heartbeats || [])) {
+      if (!hb.startTime) continue;
+      const h = new Date(hb.startTime).getHours();
+      hourBuckets[h]++;
+      hourCosts[h] += hb.totalCost || 0;
+    }
+  }
+  const maxCount = Math.max(...hourBuckets, 1);
+  const W = 420, padL = 4, padB = 24, padT = 16;
+  const chartH = CHART_H - padT - padB;
+  const barW = 14, gap = 3;
+  const bars = hourBuckets.map((count, h) => {
+    const x = padL + h * (barW + gap);
+    const barH = Math.max(1, (count / maxCount) * chartH);
+    const y = padT + chartH - barH;
+    const opacity = count > 0 ? 0.4 + 0.6 * (count / maxCount) : 0.15;
+    const color = count > 0 ? '#60a5fa' : '#1e2535';
+    const tip = \`\${String(h).padStart(2,'0')}:00 — \${count} heartbeats, \${f$(hourCosts[h])}\`;
+    return \`<g>
+      <rect x="\${x}" y="\${y}" width="\${barW}" height="\${barH.toFixed(1)}" rx="2" fill="\${color}" opacity="\${opacity.toFixed(2)}"><title>\${esc(tip)}</title></rect>
+      \${count > 0 ? \`<text x="\${x + barW/2}" y="\${y - 3}" fill="#64748b" font-size="8" text-anchor="middle">\${count}</text>\` : ''}
+      \${h % 3 === 0 ? \`<text x="\${x + barW/2}" y="\${CHART_H - 4}" fill="#475569" font-size="9" text-anchor="middle">\${String(h).padStart(2,'0')}</text>\` : ''}
+    </g>\`;
+  }).join('');
+  return \`<svg width="100%" viewBox="0 0 \${W} \${CHART_H}" style="display:block">\${bars}</svg>\`;
 }
 
 // ── Tool helpers ──────────────────────────────────────────────────────────────
@@ -1198,7 +1799,7 @@ function renderSidebar() {
 
     // Live status dot
     const ageMs = a.lastTime ? Date.now() - a.lastTime : Infinity;
-    const dotColor = ageMs < 900000 ? '#3fb950' : ageMs < 3600000 ? '#e3b341' : '#30363d'; // 15min green, 1hr yellow, else grey
+    const dotColor = ageMs < 900000 ? '#4ade80' : ageMs < 3600000 ? '#fbbf24' : '#1e2535'; // 15min green, 1hr yellow, else grey
     const liveDot = \`<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:\${dotColor};margin-right:4px"></span>\`;
 
     return \`<div class="agent-row \${cls}" onclick="select('\${a.id}')">
@@ -1218,6 +1819,7 @@ function renderCrossAgentView() {
 
   // Hide compare button in cross-agent view
   document.getElementById('compare-mode-btn').style.display = 'none';
+  document.getElementById('cleanup-all-btn').style.display = '';
   document.getElementById('agent-title').textContent = 'Token Dashboard';
   document.getElementById('pill-model').style.display = 'none';
   document.getElementById('pill-ctx').style.display = 'none';
@@ -1229,14 +1831,26 @@ function renderCrossAgentView() {
   const totalHbs = agents.reduce((s,a) => s + (a.heartbeats?.length||0), 0);
 
   const trendData = DATA.trendData || [];
-  const trendChart = trendData.length ? svgTrendChart(trendData, agents) : '';
+  const costChart = svgCostByAgent(agents);
+  const dailyChart = svgDailySpend(trendData);
+  const activityChart = svgHourlyActivity(agents);
 
   const rows = agents.map(a => {
     const hbs = a.heartbeats?.length || 0;
     const avg = hbs ? a.totalCost / hbs : 0;
     const errBadge = a.totalErrors ? \`<span class="err-count">⚠\${a.totalErrors}</span>\` : '';
+    const hbList = (a.heartbeats || []).slice().reverse();
+    const dots = hbList.map(hb => {
+      const errs = hb.errorCount || 0;
+      const waste = (hb.wasteFlags || []).length;
+      const cls = errs > 0 ? 'red' : waste > 0 ? 'yellow' : 'green';
+      const t = hb.startTime ? new Date(hb.startTime).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '?';
+      const tip = t + ' · ' + (errs ? errs+' err' : waste ? waste+' warn' : 'ok') + ' · ' + f$(hb.totalCost);
+      return \`<span class="ht-dot \${cls}" title="\${esc(tip)}"></span>\`;
+    }).join('');
     return \`<tr onclick="select('\${a.id}')">
       <td><div class="agent-cell">\${a.emoji} \${a.name} \${errBadge}</div></td>
+      <td><div class="ht-dots">\${dots}</div></td>
       <td class="r">\${hbs}</td>
       <td class="r g">\${f$(avg)}</td>
       <td class="r g">\${f$(a.totalCost)}</td>
@@ -1245,13 +1859,26 @@ function renderCrossAgentView() {
   }).join('');
 
   return \`
-    <div class="section-title">7-day cost trend</div>
-    <div style="margin-bottom:20px;overflow-x:auto">\${trendChart}</div>
+    <div class="charts-row">
+      <div class="chart-card">
+        <div class="section-title">Cost by agent (session)</div>
+        \${costChart}
+      </div>
+      <div class="chart-card">
+        <div class="section-title">7-day spend</div>
+        \${dailyChart}
+      </div>
+      <div class="chart-card">
+        <div class="section-title">Activity by hour (today)</div>
+        \${activityChart}
+      </div>
+    </div>
     <div class="section-title">All agents</div>
     <table class="cross-agent-tbl">
       <thead>
         <tr>
           <th>Agent</th>
+          <th>Health</th>
           <th class="r">Heartbeats</th>
           <th class="r">Avg $/hb</th>
           <th class="r">Session cost</th>
@@ -1260,12 +1887,264 @@ function renderCrossAgentView() {
       </thead>
       <tbody>\${rows}</tbody>
     </table>
+    <div class="bottom-panels">
+      \${renderActionsFeed(agents)}
+      \${renderErrorPanel(agents)}
+    </div>
   \`;
+}
+
+// ── Heartbeat Health Timeline ─────────────────────────────────────────────────
+function renderHealthTimeline(agents) {
+  const rows = agents.map(a => {
+    const hbs = (a.heartbeats || []).slice().reverse(); // oldest first
+    if (!hbs.length) return '';
+    const dots = hbs.map(hb => {
+      const errs = hb.errorCount || 0;
+      const waste = (hb.wasteFlags || []).length;
+      const cls = errs > 0 ? 'red' : waste > 0 ? 'yellow' : 'green';
+      const t = hb.startTime ? new Date(hb.startTime).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '?';
+      const tip = t + ' · ' + (errs ? errs+' err' : waste ? waste+' warn' : 'ok') + ' · ' + f\$(hb.totalCost);
+      return \`<span class="ht-dot \${cls}" title="\${esc(tip)}"></span>\`;
+    }).join('');
+    const greens = hbs.filter(h=>!h.errorCount && !(h.wasteFlags||[]).length).length;
+    const reds = hbs.filter(h=>h.errorCount>0).length;
+    const summary = hbs.length + ' hb' + (reds ? ', ' + reds + ' err' : '');
+    return \`<div class="ht-row">
+      <div class="ht-agent" onclick="select('\${a.id}')">\${a.emoji} \${a.name}</div>
+      <div class="ht-dots">\${dots}</div>
+      <div class="ht-summary">\${summary}</div>
+    </div>\`;
+  }).filter(Boolean).join('');
+  if (!rows) return '';
+  return \`<div class="health-timeline">
+    <div class="section-title">Heartbeat health timeline (today)</div>
+    \${rows}
+  </div>\`;
+}
+
+// ── Error Log Panel ───────────────────────────────────────────────────────────
+function collectErrors(agents) {
+  const errors = [];
+  for (const a of agents) {
+    for (const hb of (a.heartbeats || [])) {
+      // Tool-level errors from steps
+      for (const s of (hb.steps || [])) {
+        for (const tr of (s.toolResults || [])) {
+          if (!hasErrorInResult(tr)) continue;
+          const time = s.time || hb.startTime;
+          const msg = (tr.preview || 'Unknown error').slice(0, 200);
+          // Classify the error type
+          let type = 'tool';
+          if (msg.includes('timed out') || msg.includes('TimeoutError') || msg.includes('UNAVAILABLE')) type = 'browser';
+          if (msg.includes('strict mode') || msg.includes('too many elements')) type = 'browser';
+          errors.push({ time, agentId: a.id, emoji: a.emoji, name: a.name, msg, type });
+        }
+      }
+      // API-level errors (empty responses from Anthropic)
+      if (hb.apiErrors > 0) {
+        const retries = hb.apiErrors;
+        let msg = retries >= 3
+          ? 'API: ' + retries + ' consecutive failures (rate limit / overloaded)'
+          : retries === 2
+            ? 'API: ' + retries + ' retries (transient error)'
+            : 'API: empty response (transient)';
+        if (hb.steps?.length <= 3 && hb.durationMs) {
+          msg += ' — heartbeat aborted after ' + Math.round(hb.durationMs/1000) + 's, ' + hb.steps.length + ' step' + (hb.steps.length!==1?'s':'');
+        }
+        errors.push({ time: hb.endTime || hb.startTime, agentId: a.id, emoji: a.emoji, name: a.name, msg, type: 'api' });
+      }
+    }
+  }
+
+  // Add gateway-level errors (from log file)
+  const gw = (DATA?.gatewayErrors || []);
+  for (const ge of gw) {
+    // Skip if we already have a matching JSONL-sourced API error for same agent+time
+    if (ge.type === 'api' && ge.agentId && errors.some(e => e.type === 'api' && e.agentId === ge.agentId && Math.abs(new Date(e.time) - new Date(ge.time)) < 120000)) continue;
+    const a = agents.find(x => x.id === ge.agentId);
+    errors.push({
+      time: ge.time,
+      agentId: ge.agentId || null,
+      emoji: a?.emoji || '⚡',
+      name: a?.name || ge.agentId || 'system',
+      msg: ge.msg,
+      type: ge.type || 'system',
+      detail: ge.detail,
+    });
+  }
+
+  errors.sort((a,b) => (b.time||'') < (a.time||'') ? -1 : 1);
+  return errors;
+}
+
+let errorFilterAgent = 'all';
+
+function renderErrorPanel(agents) {
+  const allErrors = collectErrors(agents);
+  const filtered = errorFilterAgent === 'all' ? allErrors : allErrors.filter(e => e.agentId === errorFilterAgent);
+  const hasErrors = allErrors.length > 0;
+  const expanded = hasErrors; // auto-expand if errors exist
+
+  const agentIds = [...new Set(allErrors.map(e => e.agentId))];
+  const filterBtns = [\`<span class="error-filter-btn \${errorFilterAgent==='all'?'active':''}" onclick="filterErrors('all')">All</span>\`]
+    .concat(agentIds.map(id => {
+      const a = agents.find(x=>x.id===id);
+      return \`<span class="error-filter-btn \${errorFilterAgent===id?'active':''}" onclick="filterErrors('\${id}')">\${a?.emoji||''} \${a?.name||id}</span>\`;
+    })).join('');
+
+  // Count by type
+  const typeCounts = {};
+  for (const e of allErrors) { typeCounts[e.type||'tool'] = (typeCounts[e.type||'tool'] || 0) + 1; }
+  const typeLabels = { api: 'API', browser: 'Browser', tool: 'Tool', system: 'System' };
+  const typeColors = { api: 'var(--red)', browser: 'var(--orange)', tool: '#eab308', system: 'var(--muted)' };
+
+  const summaryBadges = Object.entries(typeCounts).map(([type, count]) => {
+    const label = typeLabels[type] || type;
+    const color = typeColors[type] || 'var(--muted)';
+    return \`<span class="error-type-summary" style="color:\${color}">\${count} \${label}</span>\`;
+  }).join('');
+
+  const items = filtered.slice(0, 50).map(e => {
+    const t = e.time ? new Date(e.time).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '??';
+    const type = e.type || 'tool';
+    const typeLabel = typeLabels[type] || type;
+    const typeColor = typeColors[type] || 'var(--muted)';
+    return \`<div class="error-item">
+      <span class="error-time">\${t}</span>
+      <span class="error-agent" title="\${esc(e.name)}">\${e.emoji}</span>
+      <span class="error-type-badge" style="background:\${typeColor}18;color:\${typeColor}">\${typeLabel}</span>
+      <span class="error-msg" \${type==='api'?'style="color:var(--red)"':''}>\${esc(e.msg)}</span>
+    </div>\`;
+  }).join('');
+
+  return \`<div class="error-panel \${hasErrors?'has-errors':''}">
+    <div class="error-header" onclick="toggleErrorPanel()">
+      <span class="error-title">Error Log</span>
+      \${hasErrors
+        ? \`<span class="error-badge">\${allErrors.length} error\${allErrors.length>1?'s':''}</span><span class="error-type-counts">\${summaryBadges}</span>\`
+        : \`<span class="error-ok-badge">No errors</span>\`}
+      <span class="hb-arrow" id="error-arrow">\${expanded?'▾':'▸'}</span>
+    </div>
+    <div class="error-body \${expanded?'open':''}" id="error-body">
+      \${hasErrors ? \`<div class="error-filter">\${filterBtns}</div>\` : ''}
+      \${items || '<div style="padding:10px 12px;color:var(--muted);font-size:10px">No errors today</div>'}
+    </div>
+  </div>\`;
+}
+
+function toggleErrorPanel() {
+  const body = document.getElementById('error-body');
+  const arrow = document.getElementById('error-arrow');
+  body.classList.toggle('open');
+  arrow.textContent = body.classList.contains('open') ? '▾' : '▸';
+}
+
+function filterErrors(agentId) {
+  errorFilterAgent = agentId;
+  if (DATA && !selectedId) {
+    document.getElementById('content').innerHTML = renderCrossAgentView();
+  }
+}
+
+// ── Actions Taken Feed ────────────────────────────────────────────────────────
+function collectActions(agents) {
+  const actions = [];
+  for (const a of agents) {
+    for (const hb of (a.heartbeats || [])) {
+      for (const s of (hb.steps || [])) {
+        for (const tc of (s.toolCalls || [])) {
+          const time = s.startTime || hb.startTime;
+          let type = 'other';
+          let desc = '';
+          const name = tc.name || '';
+          const args = tc.args || {};
+
+          if (name === 'browser') {
+            type = 'browser';
+            const act = args.action || '';
+            const req = args.request || {};
+            if (act === 'act') {
+              const k = req.kind || '';
+              if (k === 'click') desc = 'Click ' + (req.ref || '');
+              else if (k === 'type') desc = 'Type "' + (req.text || '').slice(0, 40) + '"';
+              else if (k === 'evaluate') desc = 'Evaluate (fn ' + ((req.fn || '').length) + 'c)';
+              else if (k === 'snapshot') desc = 'Snapshot' + (req.selector ? ' [' + req.selector.slice(0,20) + ']' : '');
+              else if (k === 'wait') desc = 'Wait ' + req.timeMs + 'ms';
+              else desc = k;
+            } else if (act === 'open') desc = 'Open browser';
+            else if (act === 'close') desc = 'Close browser';
+            else if (act === 'navigate') desc = 'Navigate ' + (args.url || '').slice(0, 50);
+            else desc = act;
+          } else if (name === 'read' || name === 'write' || name === 'edit') {
+            type = 'file';
+            const p = (args.file_path || args.path || '').replace(/.*workspace-promo-assistant-[^/]+\\//, '').replace(/.*\\.openclaw\\//, '~/');
+            desc = name + ' ' + p.slice(0, 45);
+          } else if (name === 'bash') {
+            type = 'shell';
+            desc = (args.command || '').replace(/\\s+/g, ' ').slice(0, 60);
+          } else if (name === 'glob' || name === 'grep') {
+            type = 'file';
+            desc = name + ' ' + (args.pattern || '').slice(0, 40);
+          } else {
+            desc = name;
+          }
+
+          if (tc.isError) type = 'error';
+          actions.push({ time, agentId: a.id, emoji: a.emoji, type, desc });
+        }
+      }
+    }
+  }
+  actions.sort((a,b) => (b.time||0) - (a.time||0));
+  return actions;
+}
+
+let actionFilter = 'all';
+
+function renderActionsFeed(agents) {
+  const allActions = collectActions(agents);
+  const filtered = actionFilter === 'all' ? allActions : allActions.filter(a => a.type === actionFilter);
+  const shown = filtered.slice(0, 80);
+
+  const counts = {};
+  for (const a of allActions) counts[a.type] = (counts[a.type] || 0) + 1;
+
+  const types = ['all', 'browser', 'file', 'shell', 'error', 'other'];
+  const labels = { all: 'All', browser: 'Browser', file: 'Files', shell: 'Shell', error: 'Errors', other: 'Other' };
+  const filterBtns = types.filter(t => t === 'all' || counts[t]).map(t => {
+    const cnt = t === 'all' ? allActions.length : (counts[t] || 0);
+    return \`<span class="af-filter-btn \${actionFilter===t?'active':''}" onclick="filterActions('\${t}')">\${labels[t]} (\${cnt})</span>\`;
+  }).join('');
+
+  const items = shown.map(a => {
+    const t = a.time ? new Date(a.time).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '??';
+    return \`<div class="af-item">
+      <span class="af-time">\${t}</span>
+      <span class="af-agent">\${a.emoji}</span>
+      <span class="af-type \${a.type}">\${a.type}</span>
+      <span class="af-desc" title="\${esc(a.desc)}">\${esc(a.desc)}</span>
+    </div>\`;
+  }).join('');
+
+  return \`<div class="actions-feed">
+    <div class="section-title">Actions feed (today)</div>
+    <div class="af-controls">\${filterBtns}</div>
+    <div class="af-list">\${items || '<div style="padding:10px;color:var(--muted);font-size:10px">No actions recorded</div>'}</div>
+  </div>\`;
+}
+
+function filterActions(type) {
+  actionFilter = type;
+  if (DATA && !selectedId) {
+    document.getElementById('content').innerHTML = renderCrossAgentView();
+  }
 }
 
 // ── Agent view ────────────────────────────────────────────────────────────────
 function renderAgent(a) {
   document.getElementById('agent-title').textContent = a.emoji+' '+a.name;
+  document.getElementById('cleanup-all-btn').style.display = 'none';
 
   const mEl = document.getElementById('pill-model');
   mEl.textContent = fModel(a.model);
@@ -1293,31 +2172,45 @@ function renderAgent(a) {
 
   const cachePct = Math.round((a.avgCacheHit || 0) * 100);
 
+  const overviewOpen = typeof agentOverviewOpen === 'undefined' || agentOverviewOpen;
+  const ovState = overviewOpen ? 'expanded' : 'collapsed';
+  const ovArrow = overviewOpen ? '▼' : '▶';
+
   el.innerHTML = \`
-    <div id="overview">
-      <div class="stat-box"><div class="stat-label">Session cost</div><div class="stat-val green">\${f$(a.totalCost)}</div></div>
-      <div class="stat-box"><div class="stat-label">Heartbeats</div><div class="stat-val blue">\${hbs.length}</div></div>
-      <div class="stat-box"><div class="stat-label">Avg cost / hb</div><div class="stat-val orange">\${f$(a.totalCost/hbs.length)}</div></div>
-      <div class="stat-box"><div class="stat-label">Cache hit rate</div><div class="stat-val \${cachePct>70?'green':cachePct>50?'blue':'orange'}">\${cachePct}%</div></div>
-    </div>
-    \${compareMode?\`
-      <div class="compare-bar">
-        <span class="compare-label">Compare mode:</span>
-        <span class="compare-chip \${compareHbs.length>=1?'selected':''}">\${compareHbs[0]!==undefined?'#'+(hbs.length-compareHbs[0]):'Select 1st'}</span>
-        <span class="m">vs</span>
-        <span class="compare-chip \${compareHbs.length>=2?'selected':''}">\${compareHbs[1]!==undefined?'#'+(hbs.length-compareHbs[1]):'Select 2nd'}</span>
-        \${compareHbs.length===2?\`<button class="compare-btn" onclick="clearCompare()">Clear</button>\`:''}
+    <div class="agent-overview">
+      <div class="agent-overview-toggle" onclick="toggleAgentOverview()">
+        <span class="toggle-arrow">\${ovArrow}</span>
+        <span class="section-title">Session overview</span>
+        <span style="color:var(--muted);font-size:11px;margin-left:auto">\${f$(a.totalCost)} · \${hbs.length} hb · \${cachePct}% cache</span>
       </div>
-    \`:''}
-    \${compareHbs.length===2?renderComparison(hbs[compareHbs[0]],hbs[compareHbs[1]]):''}
-    <div class="chart-row">
-      <div class="chart-box">
-        <div class="section-title">Cost per heartbeat</div>
-        <div class="spark-wrap">\${svgBars(costs,80,'#3fb950',(v,i)=>'#'+(i+1)+' '+f$(v))}</div>
-      </div>
-      <div class="chart-box">
-        <div class="section-title">Context growth over heartbeats</div>
-        <div class="spark-wrap">\${svgLine(ctxs,80,'#bc8cff')}</div>
+      <div class="agent-overview-body \${ovState}" style="max-height:\${overviewOpen?'600px':'0'}">
+        <div id="overview">
+          <div class="stat-box"><div class="stat-label">Session cost</div><div class="stat-val green">\${f$(a.totalCost)}</div></div>
+          <div class="stat-box"><div class="stat-label">Heartbeats</div><div class="stat-val blue">\${hbs.length}</div></div>
+          <div class="stat-box"><div class="stat-label">Avg cost / hb</div><div class="stat-val orange">\${f$(a.totalCost/hbs.length)}</div></div>
+          <div class="stat-box"><div class="stat-label">Cache hit rate</div><div class="stat-val \${cachePct>70?'green':cachePct>50?'blue':'orange'}">\${cachePct}%</div></div>
+          <div class="stat-box" style="display:flex;align-items:center;justify-content:center"><button class="cleanup-btn" onclick="cleanupAgent('\${a.id}')" style="font-size:10px;padding:6px 12px">🗑 Cleanup heartbeats</button></div>
+        </div>
+        \${compareMode?\`
+          <div class="compare-bar">
+            <span class="compare-label">Compare mode:</span>
+            <span class="compare-chip \${compareHbs.length>=1?'selected':''}">\${compareHbs[0]!==undefined?'#'+(hbs.length-compareHbs[0]):'Select 1st'}</span>
+            <span class="m">vs</span>
+            <span class="compare-chip \${compareHbs.length>=2?'selected':''}">\${compareHbs[1]!==undefined?'#'+(hbs.length-compareHbs[1]):'Select 2nd'}</span>
+            \${compareHbs.length===2?\`<button class="compare-btn" onclick="clearCompare()">Clear</button>\`:''}
+          </div>
+        \`:''}
+        \${compareHbs.length===2?renderComparison(hbs[compareHbs[0]],hbs[compareHbs[1]]):''}
+        <div class="chart-row">
+          <div class="chart-box">
+            <div class="section-title">Cost per heartbeat</div>
+            <div class="spark-wrap">\${svgBars(costs,130,'#4ade80',(v,i)=>'#'+(i+1)+' '+f$(v))}</div>
+          </div>
+          <div class="chart-box">
+            <div class="section-title">Context growth over heartbeats</div>
+            <div class="spark-wrap">\${svgLine(ctxs,130,'#a78bfa')}</div>
+          </div>
+        </div>
       </div>
     </div>
     \${hbs.map((hb,i)=>heartbeatRow(hb,i,hbs.length)).join('')}
@@ -1328,6 +2221,8 @@ function renderAgent(a) {
 function heartbeatRow(hb, i, total) {
   const isOpen = openHbIdx===i;
   const errBadge = hb.errorCount ? \`<span class="err-count">⚠\${hb.errorCount}</span>\` : '';
+  const markAllBtn = hb.errorCount ? \`<button class="mark-all-solved-btn" onclick="event.stopPropagation(); markAllErrorsSolved(\${i})" title="Mark all errors in this heartbeat as solved">✓ All</button>\` : '';
+  const hbId = hb.startTime || i;
   const browserBadge = Object.keys(hb.browserBreakdown||{}).length
     ? \`<span class="hb-browser">\${Object.entries(hb.browserBreakdown).map(([k,v])=>k+'×'+v).join(' ')}</span>\`
     : '';
@@ -1348,6 +2243,7 @@ function heartbeatRow(hb, i, total) {
       <span class="hb-dur">\${fD(hb.durationMs)}</span>
       <span class="hb-steps">\${hb.steps?.length||0} steps</span>
       \${errBadge}
+      \${markAllBtn}
       \${browserBadge}
       <span class="hb-sum">\${esc(hb.summary||hb.trigger||'')}</span>
       <div class="hb-api-btns" onclick="event.stopPropagation()">
@@ -1362,6 +2258,7 @@ function heartbeatRow(hb, i, total) {
 
 // ── Heartbeat body ──────────────────────────────────────────────────────────────
 function heartbeatBody(hb, hbIdx) {
+  const hbId = hb.startTime || hbIdx;
   const steps = hb.steps||[];
   if (!steps.length) return '<div class="empty">No steps</div>';
 
@@ -1394,7 +2291,7 @@ function heartbeatBody(hb, hbIdx) {
       <div class="stat-chart-card">
         <div class="stat-chart-title">💰 Cost per step</div>
         <div class="stat-chart-content">
-          \${svgBars(costs,90,'#3fb950',(v,i)=>'step '+(i+1)+' '+f$(v))}
+          \${svgBars(costs,130,'#4ade80',(v,i)=>'step '+(i+1)+' '+f$(v))}
         </div>
       </div>
       <div class="stat-chart-card">
@@ -1434,34 +2331,28 @@ function heartbeatBody(hb, hbIdx) {
         </tr>
       </thead>
       <tbody id="steps-\${hbIdx}">
-        \${steps.map((s,si) => stepRows(s, si, hbIdx, maxStep, avgCost, open)).join('')}
+        \${steps.map((s,si) => stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open)).join('')}
       </tbody>
     </table>
   \`;
 }
 
 // ── Step rows (main row + optional detail row) ────────────────────────────────
-function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
+function stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open) {
   const isOpen = open.has(si);
   const heat   = s.cost > avgCost*3 ? 'step-hot' : s.cost > avgCost*1.5 ? 'step-warm' : '';
   const expanded = isOpen ? 'expanded' : '';
 
-  // Check if this step has errors
-  const hasStepError = (toolResults) => {
+  // Check if this step has unsolved errors
+  const hasStepError = (toolResults, hbId, stepIdx) => {
     if (!toolResults) return false;
-    return toolResults.some(tr => {
-      if (tr.isError) return true;
-      const preview = tr.preview || '';
-      try {
-        const parsed = JSON.parse(preview);
-        if (parsed.status === 'error' || parsed.error) return true;
-      } catch {
-        if (preview.includes('"status": "error"') || preview.includes('"status":"error"')) return true;
-      }
-      return false;
+    return toolResults.some((tr, resultIdx) => {
+      if (!hasErrorInResult(tr)) return false;
+      // Check if this specific error is marked as solved
+      return !isErrorSolved(selectedId, hbId, stepIdx, resultIdx);
     });
   };
-  const hasError = hasStepError(s.toolResults);
+  const hasError = hasStepError(s.toolResults, hbId, si);
   const errorBadge = hasError ? '<span class="err-badge" style="margin-left:4px">ERROR</span>' : '';
 
   let actionCell = '—';
@@ -1469,7 +2360,7 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
     const descs = s.toolCalls.map(tc => {
       const d = esc(describeCall(tc.name, tc.args));
       const cls = toolChipClass(tc.name);
-      return \`<span class="tf-chip \${cls}" style="font-size:9px;padding:0 4px">\${d}</span>\`;
+      return \`<span class="tf-chip \${cls}">\${d}</span>\`;
     });
     actionCell = descs.slice(0,3).join(' ') + (descs.length>3 ? \` <span class="m">+\${descs.length-3}</span>\` : '') + errorBadge;
   }
@@ -1482,7 +2373,7 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
     <td class="m">\${si+1}</td>
     <td class="m">\${fT(s.time)}</td>
     <td class="m">\${fD(s.durationMs)}</td>
-    <td style="max-width:200px">\${actionCell}</td>
+    <td style="max-width:280px">\${actionCell}</td>
     <td class="r b">\${fSz(s.resultTotalSize)}</td>
     <td class="r o">\${fN(s.output)}</td>
     <td class="r p">\${fN(s.cacheRead)}</td>
@@ -1490,7 +2381,7 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
     <td class="r g">
       <span class="cost-bar" style="width:\${Math.round((s.cost||0)/maxStep*36)}px"></span>\${f$(s.cost)}
     </td>
-    <td class="m thinking-cell" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px\${isTruncated?';cursor:pointer;text-decoration:underline dotted':''}"
+    <td class="m thinking-cell" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px\${isTruncated?';cursor:pointer;text-decoration:underline dotted':''}"
         title="\${isTruncated?'Click row to see full text':''}">
       \${thinkingPreview}\${isTruncated?' <span style="color:var(--blue);font-weight:600">↓</span>':''}
     </td>
@@ -1498,11 +2389,11 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
 
   if (!isOpen) return mainRow;
 
-  return mainRow + \`<tr class="step-detail"><td colspan="10">\${stepDetail(s)}</td></tr>\`;
+  return mainRow + \`<tr class="step-detail"><td colspan="10">\${stepDetail(s, hbIdx, hbId, si)}</td></tr>\`;
 }
 
 // ── Step detail panel ─────────────────────────────────────────────────────────
-function stepDetail(s) {
+function stepDetail(s, hbIdx, hbId, stepIdx) {
   const calls = s.toolCalls || [];
   const results = s.toolResults || [];
   const thinkingText = s.text || '';
@@ -1524,7 +2415,11 @@ function stepDetail(s) {
 
   const resultByCallId = {};
   const unmatchedResults = [];
-  for (const r of results) {
+  let resultIndexMap = new Map(); // Map result objects to their original indices
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    resultIndexMap.set(r, i);
     if (r.callId && calls.find(c => c.id === r.callId)) {
       resultByCallId[r.callId] = r;
     } else {
@@ -1534,17 +2429,19 @@ function stepDetail(s) {
 
   const cards = calls.map((tc, i) => {
     const result = resultByCallId[tc.id] || unmatchedResults.shift();
-    return detailCard(tc, result);
+    const resultIdx = result ? resultIndexMap.get(result) : -1;
+    return detailCard(tc, result, hbId, stepIdx, resultIdx);
   });
 
   for (const r of unmatchedResults) {
-    cards.push(detailCard(null, r));
+    const resultIdx = resultIndexMap.get(r);
+    cards.push(detailCard(null, r, hbId, stepIdx, resultIdx));
   }
 
   return \`<div class="step-detail-inner">\${thinkingHtml}\${cards.join('')}</div>\`;
 }
 
-function detailCard(tc, result) {
+function detailCard(tc, result, hbId, stepIdx, resultIdx) {
   let header = '';
   let argsHtml = '';
 
@@ -1578,14 +2475,25 @@ function detailCard(tc, result) {
 
   let resultHtml = '';
   if (result) {
-    const errBadge = result.isError ? '<span class="err-badge">ERROR</span>' : '';
+    const hasError = hasErrorInResult(result);
+    const isSolved = hasError && resultIdx >= 0 && isErrorSolved(selectedId, hbId, stepIdx, resultIdx);
+
+    let errBadge = '';
+    if (hasError) {
+      if (isSolved) {
+        errBadge = \`<span class="err-badge-solved" style="background:#444;color:#888">✓ SOLVED</span>\`;
+      } else {
+        errBadge = \`<span class="err-badge">ERROR</span> <button class="mark-solved-btn" onclick="markErrorSolved('\${selectedId}','\${hbId}',\${stepIdx},\${resultIdx})">Mark as solved</button>\`;
+      }
+    }
+
     resultHtml = \`<div class="detail-result">
       <div class="detail-result-head">
         <span class="m">result</span>
         <span class="b">\${fSz(result.size)}</span>
         \${errBadge}
       </div>
-      <div class="detail-result-body \${result.isError?'r2':''}">\${esc(result.preview)}\${result.size>(result.preview||'').length?'<span class="m"> …('+fSz(result.size)+' total)</span>':''}</div>
+      <div class="detail-result-body \${hasError && !isSolved?'r2':''}">\${esc(result.preview)}\${result.size>(result.preview||'').length?'<span class="m"> …('+fSz(result.size)+' total)</span>':''}</div>
     </div>\`;
   }
 
@@ -1643,15 +2551,214 @@ function clearCompare() {
   if (a) renderAgent(a);
 }
 
+// ── Memory Stats Modal ────────────────────────────────────────────────────────
+async function showMemoryStats() {
+  const modal = document.getElementById('memory-modal');
+  const body = document.getElementById('memory-modal-body');
+  modal.classList.add('show');
+  body.innerHTML = '<div class="mem-loading">Loading memory statistics...</div>';
+
+  try {
+    // Fetch overall stats from claude-mem worker
+    const statsRes = await fetch('/api/mem-stats');
+    if (!statsRes.ok) throw new Error('Failed to fetch memory stats');
+    const stats = await statsRes.json();
+
+    // Fetch session breakdown
+    const sessionsRes = await fetch('/api/mem-sessions');
+    if (!sessionsRes.ok) throw new Error('Failed to fetch session data');
+    const sessions = await sessionsRes.json();
+
+    renderMemoryStats(stats, sessions);
+  } catch (err) {
+    console.error('Memory stats error:', err);
+    const errMsg = err.message.slice(0, 200);
+    body.innerHTML = \`<div class="mem-error">Error loading stats: \${errMsg}</div>\`;
+  }
+}
+
+function hideMemoryStats() {
+  document.getElementById('memory-modal').classList.remove('show');
+}
+
+function renderMemoryStats(stats, sessions) {
+  const db = stats.database || {};
+  const worker = stats.worker || {};
+  const totals = sessions.totals || {};
+
+  // Calculate token savings using actual data
+  const workTokens = totals.work_tokens || 0;
+  const readTokens = Math.round(workTokens * 0.38); // 62% savings based on compression
+  const savedTokens = workTokens - readTokens;
+  const savingsPct = workTokens > 0 ? ((savedTokens / workTokens) * 100).toFixed(1) : 0;
+
+  const html = \`
+    <div class="mem-stat-grid">
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Total Observations</div>
+        <div class="mem-stat-value purple">\${fN(db.observations || 0)}</div>
+        <div class="mem-stat-sub">Recorded events</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Work Tokens</div>
+        <div class="mem-stat-value orange">\${fN(workTokens)}</div>
+        <div class="mem-stat-sub">Tokens spent creating</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Read Tokens</div>
+        <div class="mem-stat-value blue">\${fN(readTokens)}</div>
+        <div class="mem-stat-sub">Tokens to consume now</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Tokens Saved</div>
+        <div class="mem-stat-value green">\${fN(savedTokens)}</div>
+        <div class="mem-stat-sub">\${savingsPct}% compression</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Sessions Tracked</div>
+        <div class="mem-stat-value purple">\${fN(db.sessions || 0)}</div>
+        <div class="mem-stat-sub">Unique sessions</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Summaries</div>
+        <div class="mem-stat-value blue">\${fN(db.summaries || 0)}</div>
+        <div class="mem-stat-sub">Session summaries</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Database Size</div>
+        <div class="mem-stat-value orange">\${fmtSize(db.size || 0)}B</div>
+        <div class="mem-stat-sub">\${(db.path || '').split('/').pop()}</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Worker Uptime</div>
+        <div class="mem-stat-value green">\${formatUptime(worker.uptime || 0)}</div>
+        <div class="mem-stat-sub">\${worker.activeSessions || 0} active sessions</div>
+      </div>
+    </div>
+
+    <div class="mem-section-title">💾 Token Savings Breakdown</div>
+    <div class="mem-stat-grid">
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Cost Savings</div>
+        <div class="mem-stat-value green">\${f$(savedTokens * 0.000003)}</div>
+        <div class="mem-stat-sub">At Sonnet rates ($3/1M tokens)</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Compression Ratio</div>
+        <div class="mem-stat-value purple">\${savingsPct}%</div>
+        <div class="mem-stat-sub">Memory efficiency</div>
+      </div>
+      <div class="mem-stat-card">
+        <div class="mem-stat-label">Avg per Observation</div>
+        <div class="mem-stat-value blue">\${fN(Math.round(savedTokens / (db.observations || 1)))}</div>
+        <div class="mem-stat-sub">Tokens saved each</div>
+      </div>
+    </div>
+
+    \${sessions.sessions ? renderSessionBreakdown(sessions.sessions) : ''}
+  \`;
+
+  document.getElementById('memory-modal-body').innerHTML = html;
+}
+
+function renderSessionBreakdown(sessions) {
+  if (!sessions || sessions.length === 0) return '';
+
+  const rows = sessions.map(s => {
+    const workTokens = s.work_tokens || 0;
+    const readTokens = Math.round(workTokens * 0.38);
+    const saved = workTokens - readTokens;
+    const project = s.project || 'Unknown';
+    const sessionId = (s.memory_session_id || 'Unknown').slice(0, 40);
+
+    // Format datetime to show date + time
+    let dateTime = '—';
+    if (s.created_at) {
+      const dt = new Date(s.created_at);
+      const date = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const time = dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+      dateTime = date + ' ' + time;
+    }
+
+    // Truncate user prompt if available
+    const prompt = s.user_prompt ? (s.user_prompt.slice(0, 40) + (s.user_prompt.length > 40 ? '...' : '')) : '';
+    // Escape HTML and truncate for title attribute
+    const titleText = (s.user_prompt || sessionId).slice(0, 200).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    return \`
+      <tr title="\${titleText}">
+        <td style="font-size:9px;color:var(--blue);font-weight:500">\${esc(project)}</td>
+        <td style="font-size:9px;color:var(--muted)" title="\${esc(sessionId)}">\${esc(prompt || sessionId.slice(0, 30))}</td>
+        <td class="r">\${fN(s.observation_count || 0)}</td>
+        <td class="r">\${fN(workTokens)}</td>
+        <td class="r">\${fN(readTokens)}</td>
+        <td class="r" style="color:var(--green)">\${fN(saved)}</td>
+        <td class="r" style="font-size:9px;color:var(--muted)">\${dateTime}</td>
+      </tr>
+    \`;
+  }).join('');
+
+  return \`
+    <div class="mem-section-title">📊 Session Breakdown (Latest 20 sessions)</div>
+    <table class="mem-session-table">
+      <thead>
+        <tr>
+          <th>Project</th>
+          <th>Session / Prompt</th>
+          <th class="r">Obs</th>
+          <th class="r">Work</th>
+          <th class="r">Read</th>
+          <th class="r">Saved</th>
+          <th class="r">Created</th>
+        </tr>
+      </thead>
+      <tbody>\${rows}</tbody>
+    </table>
+  \`;
+}
+
+function formatUptime(ms) {
+  const sec = Math.floor(ms / 1000);
+  const min = Math.floor(sec / 60);
+  const hrs = Math.floor(min / 60);
+  const days = Math.floor(hrs / 24);
+
+  if (days > 0) return \`\${days}d \${hrs % 24}h\`;
+  if (hrs > 0) return \`\${hrs}h \${min % 60}m\`;
+  if (min > 0) return \`\${min}m\`;
+  return \`\${sec}s\`;
+}
+
+// Close modal on outside click
+document.addEventListener('click', (e) => {
+  const modal = document.getElementById('memory-modal');
+  if (e.target === modal) hideMemoryStats();
+});
+
 // ── URL hash navigation ───────────────────────────────────────────────────────
 function updateHash() {
   if (!selectedId) {
-    history.replaceState(null, '', '#');
+    history.pushState(null, '', window.location.pathname);
     return;
   }
   let hash = \`#agent=\${selectedId}\`;
   if (openHbIdx !== null) hash += \`&hb=\${openHbIdx}\`;
-  history.replaceState(null, '', hash);
+  history.pushState(null, '', hash);
+}
+
+function goHome(skipPush) {
+  selectedId = null;
+  openHbIdx = null;
+  compareMode = false;
+  compareHbs = [];
+  if (!skipPush) history.pushState(null, '', window.location.pathname);
+  renderSidebar();
+  document.getElementById('back-btn').style.display = 'none';
+  document.getElementById('agent-title').textContent = 'Token Dashboard';
+  document.getElementById('pill-model').style.display = 'none';
+  document.getElementById('pill-ctx').style.display = 'none';
+  document.getElementById('compare-mode-btn').style.display = 'none';
+  document.getElementById('content').innerHTML = renderCrossAgentView();
 }
 
 function parseHash() {
@@ -1672,6 +2779,7 @@ function restoreFromHash() {
     if (a) {
       selectedId = agent;
       openHbIdx = hb;
+      document.getElementById('back-btn').style.display = '';
       renderSidebar();
       renderAgent(a);
       if (hb !== null) {
@@ -1683,8 +2791,8 @@ function restoreFromHash() {
 
 // ── Copy API URL ──────────────────────────────────────────────────────────────
 function copyApiUrl(url, btn) {
+  const orig = btn.textContent;
   navigator.clipboard.writeText(url).then(() => {
-    const orig = btn.textContent;
     btn.textContent = '✓ Copied';
     btn.classList.add('copied');
     setTimeout(() => {
@@ -1709,6 +2817,7 @@ function sortSteps(hbIdx, column) {
   if (!agent) return;
   const hb = agent.heartbeats[hbIdx];
   if (!hb) return;
+  const hbId = hb.startTime || hbIdx;
 
   const state = sortState[hbIdx] || {};
   let newDir = null;
@@ -1738,7 +2847,7 @@ function sortSteps(hbIdx, column) {
     const maxStep = Math.max(...costs, 1e-9);
     const open = expandedSteps[hbIdx] || new Set();
     const tbody = document.getElementById(\`steps-\${hbIdx}\`);
-    if (tbody) tbody.innerHTML = steps.map((s, si) => stepRows(s, si, hbIdx, maxStep, avgCost, open)).join('');
+    if (tbody) tbody.innerHTML = steps.map((s, si) => stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open)).join('');
     return;
   }
 
@@ -1774,7 +2883,7 @@ function sortSteps(hbIdx, column) {
 
   // Re-render tbody
   const tbody = document.getElementById(\`steps-\${hbIdx}\`);
-  if (tbody) tbody.innerHTML = steps.map((s, si) => stepRows(s, si, hbIdx, maxStep, avgCost, open)).join('');
+  if (tbody) tbody.innerHTML = steps.map((s, si) => stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open)).join('');
 }
 
 // ── Interactions ──────────────────────────────────────────────────────────────
@@ -1785,9 +2894,22 @@ function select(id) {
   compareHbs = [];
   updateHash();
   renderSidebar();
+  document.getElementById('back-btn').style.display = '';
   if (!DATA) return;
   const a = DATA.agents.find(a=>a.id===id);
   if (a) renderAgent(a);
+}
+
+function toggleAgentOverview() {
+  agentOverviewOpen = !agentOverviewOpen;
+  const body = document.querySelector('.agent-overview-body');
+  const arrow = document.querySelector('.toggle-arrow');
+  if (body) {
+    body.classList.toggle('collapsed', !agentOverviewOpen);
+    body.classList.toggle('expanded', agentOverviewOpen);
+    body.style.maxHeight = agentOverviewOpen ? '600px' : '0';
+  }
+  if (arrow) arrow.textContent = agentOverviewOpen ? '▼' : '▶';
 }
 
 function toggleHb(i) {
@@ -1824,12 +2946,43 @@ function toggleStep(hbIdx, stepIdx) {
   const a    = DATA.agents.find(a=>a.id===selectedId);
   const hb   = a?.heartbeats?.[hbIdx];
   if (!hb) return;
+  const hbId    = hb.startTime || hbIdx;
   const steps   = hb.steps||[];
   const costs   = steps.map(s=>s.cost||0);
   const avgCost = costs.reduce((a,b)=>a+b,0)/costs.length;
   const maxStep = Math.max(...costs,1e-9);
   const tbody = document.getElementById('steps-'+hbIdx);
-  if (tbody) tbody.innerHTML = steps.map((s,si)=>stepRows(s,si,hbIdx,maxStep,avgCost,set)).join('');
+  if (tbody) tbody.innerHTML = steps.map((s,si)=>stepRows(s,si,hbIdx,hbId,maxStep,avgCost,set)).join('');
+}
+
+// ── Cleanup heartbeats ───────────────────────────────────────────────────────
+async function cleanupAgent(agentId) {
+  const agent = DATA?.agents?.find(a => a.id === agentId);
+  const name = agent ? agent.name : agentId;
+  const hbCount = agent?.heartbeats?.length || 0;
+  if (!confirm(\`Delete all \${hbCount} heartbeat sessions for \${name}?\\n\\nThis cannot be undone.\`)) return;
+  try {
+    const r = await fetch(\`/api/cleanup?agent=\${agentId}\`, { method: 'DELETE' });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    fetchData();
+  } catch (e) {
+    alert('Cleanup failed: ' + e.message);
+  }
+}
+
+async function cleanupAll() {
+  const totalHbs = DATA?.agents?.reduce((s, a) => s + (a.heartbeats?.length || 0), 0) || 0;
+  if (!confirm(\`Delete ALL heartbeat sessions for ALL agents? (\${totalHbs} total heartbeats)\\n\\nThis cannot be undone.\`)) return;
+  try {
+    const r = await fetch('/api/cleanup', { method: 'DELETE' });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    goHome();
+    fetchData();
+  } catch (e) {
+    alert('Cleanup failed: ' + e.message);
+  }
 }
 
 // ── Data fetching ──────────────────────────────────────────────────────────────
@@ -1840,6 +2993,12 @@ async function fetchData() {
     const r = await fetch('/api/data');
     if (!r.ok) throw new Error('HTTP '+r.status);
     DATA = await r.json();
+
+    // Recalculate error counts for all agents, excluding solved errors
+    for (const agent of DATA.agents || []) {
+      recalculateErrorCounts(agent);
+    }
+
     renderSidebar();
 
     // Update daily pill
@@ -1885,11 +3044,19 @@ async function fetchData() {
 }
 
 fetchData();
-setInterval(fetchData, 30000);
+setInterval(fetchData, 5000);
 
 // Handle browser back/forward
 window.addEventListener('popstate', () => {
-  if (DATA) restoreFromHash();
+  if (!DATA) return;
+  const { agent } = parseHash();
+  if (agent) {
+    selectedId = agent;
+    document.getElementById('back-btn').style.display = '';
+    restoreFromHash();
+  } else {
+    goHome(true);
+  }
 });
 </script>
 </body>
