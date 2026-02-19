@@ -1,9 +1,24 @@
 #!/usr/bin/env node
 // OpenClaw Trace
 // Repository: https://github.com/Tell-Me-Mo/openclaw-trace
-// Usage: npx openclaw-trace
-// Then open: http://localhost:3141
+// Usage: npx openclaw-trace        (foreground)
+//        npx openclaw-trace --bg   (background daemon)
 'use strict';
+
+// ── Background mode: re-spawn as detached process ────────────────────────────
+if (process.argv.includes('--bg')) {
+  const { spawn } = require('child_process');
+  const args = process.argv.slice(1).filter(a => a !== '--bg');
+  const child = spawn(process.execPath, args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  console.log(`\n  🦞 OpenClaw Trace running in background (pid ${child.pid})`);
+  console.log(`  → http://localhost:3141`);
+  console.log(`  Stop: kill ${child.pid}\n`);
+  process.exit(0);
+}
 
 const http = require('http');
 const fs   = require('fs');
