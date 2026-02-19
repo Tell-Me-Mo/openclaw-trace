@@ -40,7 +40,7 @@ const path = require('path');
 const os   = require('os');
 
 const PORT = 3141;
-const OC   = path.join(os.homedir(), '.openclaw');
+const OC   = process.env.OPENCLAW_HOME || path.join(os.homedir(), '.openclaw');
 
 // ── Data ──────────────────────────────────────────────────────────────────────
 
