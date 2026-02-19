@@ -126,7 +126,7 @@ The dashboard calculates:
 
 ### Port Configuration
 
-To change the default port (3141), edit `token-dash.js`:
+To change the default port (3141), edit `openclaw-trace.js`:
 
 ```javascript
 const PORT = 3141;  // Change to your preferred port
@@ -204,13 +204,13 @@ Both can run simultaneously with no conflicts.
 
 ## Development
 
-The entire application is a single `token-dash.js` file (~1350 lines):
+The entire application is a single `openclaw-trace.js` file (~1350 lines):
 - **Backend**: Node.js HTTP server + JSONL parser
 - **Frontend**: Embedded HTML/CSS/JS (no build step)
 - **Rendering**: Vanilla JS with SVG charts
 
 To modify:
-1. Edit `token-dash.js`
+1. Edit `openclaw-trace.js`
 2. Restart the server
 3. Refresh browser (auto-refresh will pick up data changes)
 

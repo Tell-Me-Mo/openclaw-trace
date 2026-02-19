@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "description": "End-to-end tracing and observability for OpenClaw multi-agent systems",
   "bin": {
-    "openclaw-trace": "./token-dash.js"
+    "openclaw-trace": "openclaw-trace.js"
   },
   "files": [
-    "token-dash.js",
+    "openclaw-trace.js",
     "budget.json",
     "dashboard-helper.sh"
   ],
@@ -22,7 +22,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Tell-Me-Mo/openclaw-trace.git"
+    "url": "git+https://github.com/Tell-Me-Mo/openclaw-trace.git"
   },
   "homepage": "https://github.com/Tell-Me-Mo/openclaw-trace",
   "bugs": "https://github.com/Tell-Me-Mo/openclaw-trace/issues",
