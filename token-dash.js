@@ -1869,15 +1869,20 @@ function collectErrors(agents) {
 }
 
 let errorFilterAgent = 'all';
+let errorFilterType = 'all';
 
 function renderErrorPanel(agents) {
   const allErrors = collectErrors(agents);
-  const filtered = errorFilterAgent === 'all' ? allErrors : allErrors.filter(e => e.agentId === errorFilterAgent);
+  const filtered = allErrors.filter(e => {
+    if (errorFilterAgent !== 'all' && e.agentId !== errorFilterAgent) return false;
+    if (errorFilterType !== 'all' && (e.type || 'tool') !== errorFilterType) return false;
+    return true;
+  });
   const hasErrors = allErrors.length > 0;
   const expanded = hasErrors; // auto-expand if errors exist
 
-  const agentIds = [...new Set(allErrors.map(e => e.agentId))];
-  const filterBtns = [\`<span class="error-filter-btn \${errorFilterAgent==='all'?'active':''}" onclick="filterErrors('all')">All</span>\`]
+  const agentIds = [...new Set(allErrors.map(e => e.agentId).filter(Boolean))];
+  const agentBtns = [\`<span class="error-filter-btn \${errorFilterAgent==='all'?'active':''}" onclick="filterErrors('all')">All</span>\`]
     .concat(agentIds.map(id => {
       const a = agents.find(x=>x.id===id);
       return \`<span class="error-filter-btn \${errorFilterAgent===id?'active':''}" onclick="filterErrors('\${id}')">\${a?.emoji||''} \${a?.name||id}</span>\`;
@@ -1888,6 +1893,12 @@ function renderErrorPanel(agents) {
   for (const e of allErrors) { typeCounts[e.type||'tool'] = (typeCounts[e.type||'tool'] || 0) + 1; }
   const typeLabels = { api: 'API', browser: 'Browser', tool: 'Tool', system: 'System' };
   const typeColors = { api: 'var(--red)', browser: 'var(--orange)', tool: '#eab308', system: 'var(--muted)' };
+
+  const typeBtns = Object.entries(typeCounts).map(([type, count]) => {
+    const label = typeLabels[type] || type;
+    const color = typeColors[type] || 'var(--muted)';
+    return \`<span class="error-filter-btn \${errorFilterType===type?'active':''}" onclick="filterErrorsByType('\${type}')" style="\${errorFilterType===type?'':'color:'+color}">\${count} \${label}</span>\`;
+  }).join('');
 
   const summaryBadges = Object.entries(typeCounts).map(([type, count]) => {
     const label = typeLabels[type] || type;
@@ -1917,7 +1928,7 @@ function renderErrorPanel(agents) {
       <span class="hb-arrow" id="error-arrow">\${expanded?'▾':'▸'}</span>
     </div>
     <div class="error-body \${expanded?'open':''}" id="error-body">
-      \${hasErrors ? \`<div class="error-filter">\${filterBtns}</div>\` : ''}
+      \${hasErrors ? \`<div class="error-filter">\${typeBtns}</div><div class="error-filter">\${agentBtns}</div>\` : ''}
       \${items || '<div style="padding:10px 12px;color:var(--muted);font-size:10px">No errors today</div>'}
     </div>
   </div>\`;
@@ -1932,6 +1943,13 @@ function toggleErrorPanel() {
 
 function filterErrors(agentId) {
   errorFilterAgent = agentId;
+  if (DATA && !selectedId) {
+    document.getElementById('content').innerHTML = renderCrossAgentView();
+  }
+}
+
+function filterErrorsByType(type) {
+  errorFilterType = errorFilterType === type ? 'all' : type;
   if (DATA && !selectedId) {
     document.getElementById('content').innerHTML = renderCrossAgentView();
   }
