@@ -1154,19 +1154,19 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 @media(max-width:1100px){.bottom-panels{grid-template-columns:1fr}}
 
 /* ── Error Log Panel ── */
-.error-panel{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.error-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
 .error-panel.has-errors{border-color:var(--red)33}
-.error-header{padding:10px 14px;background:var(--surface);cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none;transition:background .12s}
-.error-header:hover{background:var(--surface2)}
+.error-header{cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none;margin-bottom:10px}
 .error-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .error-badge{background:var(--red)18;color:var(--red);font-size:10px;padding:2px 8px;border-radius:12px;font-weight:600}
 .error-ok-badge{background:var(--glow-green);color:var(--green);font-size:10px;padding:2px 8px;border-radius:12px;font-weight:600}
-.error-body{display:none;max-height:300px;overflow-y:auto}
+.error-body{display:none;max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm)}
 .error-body.open{display:block}
-.error-filter{padding:8px 14px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap}
+.error-filter{padding:8px 14px;border-bottom:1px solid var(--border)33;display:flex;gap:8px;flex-wrap:wrap}
 .error-filter-btn{font-size:10px;padding:3px 10px;border-radius:12px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .12s}
 .error-filter-btn:hover,.error-filter-btn.active{background:var(--glow-blue);border-color:var(--blue)33;color:var(--blue)}
-.error-item{padding:8px 14px;border-bottom:1px solid var(--border)33;font-size:11px;display:flex;gap:10px;align-items:flex-start}
+.error-item{padding:6px 12px;border-bottom:1px solid var(--border)33;font-size:11px;display:flex;gap:10px;align-items:flex-start;transition:background .1s}
+.error-item:hover{background:var(--surface2)}
 .error-item:last-child{border-bottom:none}
 .error-time{color:var(--muted);min-width:44px;flex-shrink:0;font-family:var(--font-mono);font-size:10px}
 .error-agent{min-width:22px;flex-shrink:0}
