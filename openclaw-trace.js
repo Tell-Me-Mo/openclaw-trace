@@ -5,6 +5,20 @@
 //        npx openclaw-trace --bg   (background daemon)
 'use strict';
 
+// ── Stop: gracefully shut down a running instance ────────────────────────────
+if (process.argv.includes('--stop')) {
+  const http = require('http');
+  const req = http.get('http://127.0.0.1:3141/api/shutdown', (res) => {
+    console.log('\n  🦞 OpenClaw Trace stopped\n');
+    process.exit(0);
+  });
+  req.on('error', () => {
+    console.log('\n  No running instance found on port 3141\n');
+    process.exit(1);
+  });
+  req.setTimeout(3000, () => { req.destroy(); process.exit(1); });
+} else
+
 // ── Background mode: re-spawn as detached process ────────────────────────────
 if (process.argv.includes('--bg')) {
   const { spawn } = require('child_process');
@@ -16,7 +30,7 @@ if (process.argv.includes('--bg')) {
   child.unref();
   console.log(`\n  🦞 OpenClaw Trace running in background (pid ${child.pid})`);
   console.log(`  → http://localhost:3141`);
-  console.log(`  Stop: kill ${child.pid}\n`);
+  console.log(`  Stop: npx openclaw-trace --stop\n`);
   process.exit(0);
 }
 
@@ -923,6 +937,13 @@ http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: e.message }));
     }
     return;
+  }
+
+  // GET /api/shutdown - graceful shutdown
+  if (url === '/api/shutdown') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'shutting down' }));
+    process.exit(0);
   }
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
