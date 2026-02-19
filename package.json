@@ -1,6 +1,6 @@
 {
   "name": "openclaw-trace",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "End-to-end tracing and observability for OpenClaw multi-agent systems",
   "bin": {
     "openclaw-trace": "openclaw-trace.js"
