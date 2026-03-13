@@ -67,9 +67,11 @@ function getAgentMeta() {
 }
 
 function extractText(msg) {
-  if (typeof msg.content === 'string') return msg.content.slice(0, 140);
-  if (!Array.isArray(msg.content)) return '';
-  return msg.content.filter(c => c.type === 'text').map(c => c.text || '').join('').slice(0, 140);
+  let full;
+  if (typeof msg.content === 'string') full = msg.content;
+  else if (!Array.isArray(msg.content)) return '';
+  else full = msg.content.filter(c => c.type === 'text').map(c => c.text || '').join('');
+  return full;
 }
 
 function extractToolCalls(msg) {
@@ -142,6 +144,7 @@ function attachToolResult(step, msg) {
     callId:  msg.toolCallId || '',
     size,
     preview: text.slice(0, 500),
+    full:    size > 500 ? text : null,
     isError: msg.isError || false,
   });
   step.resultTotalSize = (step.resultTotalSize || 0) + size;
@@ -172,7 +175,7 @@ function parseHeartbeats(entries) {
             cur.steps[cur.steps.length - 1].toolResults = cur.steps[cur.steps.length - 1].toolResults || [];
             cur.steps[cur.steps.length - 1].toolResults.push({
               name: c.toolName || '?', callId: c.toolCallId || '',
-              size: text.length, preview: text.slice(0, 500), isError: c.isError || false,
+              size: text.length, preview: text.slice(0, 500), full: text.length > 500 ? text : null, isError: c.isError || false,
             });
             cur.steps[cur.steps.length - 1].resultTotalSize =
               (cur.steps[cur.steps.length - 1].resultTotalSize || 0) + text.length;
@@ -204,18 +207,19 @@ function parseHeartbeats(entries) {
       const calls = extractToolCalls(msg);
       const ts    = e.timestamp || msg.timestamp || null;
 
-      if (u && (u.totalTokens > 0 || u.output > 0)) {
+      const hasContent = text || calls.length > 0;
+      if (u && (u.totalTokens > 0 || u.output > 0) || hasContent) {
         cur.steps.push({
           time:             ts,
-          output:           u.output      || 0,
-          cacheRead:        u.cacheRead   || 0,
-          cacheWrite:       u.cacheWrite  || 0,
-          totalTokens:      u.totalTokens || 0,
+          output:           u?.output      || 0,
+          cacheRead:        u?.cacheRead   || 0,
+          cacheWrite:       u?.cacheWrite  || 0,
+          totalTokens:      u?.totalTokens || 0,
           cost,
-          costInput:        u.cost?.input      ?? 0,
-          costOutput:       u.cost?.output     ?? 0,
-          costCacheRead:    u.cost?.cacheRead  ?? 0,
-          costCacheWrite:   u.cost?.cacheWrite ?? 0,
+          costInput:        u?.cost?.input      ?? 0,
+          costOutput:       u?.cost?.output     ?? 0,
+          costCacheRead:    u?.cost?.cacheRead  ?? 0,
+          costCacheWrite:   u?.cost?.cacheWrite ?? 0,
           toolCalls:        calls,
           toolResults:      [],
           resultTotalSize:  0,
@@ -224,12 +228,12 @@ function parseHeartbeats(entries) {
           durationMs:       null,
         });
         cur.totalCost    += cost;
-        cur.totalTokensSum += u.totalTokens || 0;
-        cur.totalOutput  += u.output || 0;
-        cur.finalContext  = Math.max(cur.finalContext, u.totalTokens || 0);
+        cur.totalTokensSum += u?.totalTokens || 0;
+        cur.totalOutput  += u?.output || 0;
+        cur.finalContext  = Math.max(cur.finalContext, u?.totalTokens || 0);
         cur.endTime       = ts;
         if (text && calls.length === 0) cur.summary = text;
-      } else if (u && u.totalTokens === 0 && u.output === 0 && (!msg.content || msg.content.length === 0)) {
+      } else if (u && u.totalTokens === 0 && u.output === 0 && !hasContent) {
         // API error — empty response (rate limit, overloaded, or transient failure)
         cur.apiErrors = (cur.apiErrors || 0) + 1;
         cur.endTime = ts;
@@ -514,7 +518,8 @@ function cleanHeartbeatForAPI(hb, errorsOnly = false) {
   };
 }
 
-function loadAll() {
+function loadAll(opts = {}) {
+  const includeReset = opts.includeReset || false;
   const meta   = getAgentMeta();
   const agents = [];
   const dailyCosts = {}; // { "2026-02-11": cost }
@@ -543,7 +548,7 @@ function loadAll() {
     try {
       const files = fs.readdirSync(sessDir);
       for (const file of files) {
-        if (file.endsWith('.jsonl')) {
+        if (file.endsWith('.jsonl') || (includeReset && file.includes('.jsonl.reset.'))) {
           allSessionFiles.push(path.join(sessDir, file));
         }
       }
@@ -651,8 +656,9 @@ http.createServer(async (req, res) => {
 
   if (url === '/api/data') {
     try {
+      const includeReset = params.get('include_reset') === '1';
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(loadAll()));
+      res.end(JSON.stringify(loadAll({ includeReset })));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
@@ -1031,6 +1037,14 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 .back-btn:hover{background:var(--surface3);color:var(--text);border-color:var(--muted2)}
 .cleanup-btn{font-size:10px;padding:5px 12px;border-radius:var(--radius-sm);background:var(--red)0a;border:1px solid var(--red)22;color:var(--red);cursor:pointer;transition:all .15s}
 .cleanup-btn:hover{background:var(--red)18;border-color:var(--red)44}
+.pager{display:flex;align-items:center;justify-content:center;gap:6px;padding:10px 0;font-size:11px;color:var(--muted)}
+.pager-btn{padding:4px 10px;border-radius:var(--radius-sm);background:var(--surface);border:1px solid var(--border);color:var(--text);cursor:pointer;font-size:11px;transition:all .15s}
+.pager-btn:hover{background:var(--surface2);border-color:var(--blue)}
+.pager-btn:disabled{opacity:.3;cursor:default;background:var(--surface)}
+.pager-btn:disabled:hover{border-color:var(--border)}
+.pager-num{padding:4px 8px;border-radius:var(--radius-sm);cursor:pointer;font-size:11px;color:var(--muted);transition:all .15s}
+.pager-num:hover{background:var(--surface2);color:var(--text)}
+.pager-num.active{background:var(--blue)22;color:var(--blue);font-weight:600}
 .compare-mode-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--glow-blue);border:1px solid var(--blue)33;color:var(--blue);cursor:pointer;transition:all .15s;font-weight:600}
 .compare-mode-btn:hover{background:var(--blue)1a;border-color:var(--blue)55}
 #budget-wrap{flex:1;max-width:240px;min-width:130px;display:none}
@@ -1158,12 +1172,16 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 .thinking-section{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:8px}
 .thinking-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
 .thinking-text{font-size:11px;color:var(--text);line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
+.thinking-text.expanded{max-height:none}
 .detail-call{flex:1;min-width:220px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;font-size:11px}
 .detail-call-head{font-size:11px;font-weight:600;color:var(--blue);margin-bottom:6px;display:flex;justify-content:space-between}
 .detail-call-args{color:var(--muted);margin-bottom:8px;word-break:break-all;white-space:pre-wrap;max-height:80px;overflow-y:auto;font-family:var(--font-mono);font-size:10px}
 .detail-result{border-top:1px solid var(--border);padding-top:6px;margin-top:4px}
 .detail-result-head{font-size:10px;color:var(--muted);margin-bottom:3px;display:flex;gap:6px;align-items:center}
 .detail-result-body{color:var(--text);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow-y:auto;font-size:10px;opacity:.85;font-family:var(--font-mono)}
+.detail-result-body.expanded{max-height:none}
+.expand-btn{font-size:9px;padding:2px 8px;margin-top:4px;border-radius:3px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .15s}
+.expand-btn:hover{background:var(--surface3);color:var(--text)}
 .err-badge{color:var(--red);font-size:9px;background:var(--red)14;padding:2px 6px;border-radius:4px;font-weight:600}
 .err-badge-solved{color:var(--muted);font-size:9px;background:var(--surface2);padding:2px 6px;border-radius:4px}
 .mark-solved-btn{font-size:9px;padding:3px 8px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px;transition:all .12s}
@@ -1262,8 +1280,9 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 
 /* ── Misc ── */
 .empty{padding:60px;text-align:center;color:var(--muted);font-size:13px}
-#refresh{position:fixed;bottom:12px;right:16px;font-size:10px;color:var(--muted);font-family:var(--font-mono)}
+#refresh{position:fixed;bottom:12px;right:16px;font-size:10px;color:var(--muted);font-family:var(--font-mono);display:flex;align-items:center;gap:4px}
 #refresh.spin{color:var(--blue)}
+#refresh-interval{font-size:10px;padding:1px 2px;border-radius:3px;background:var(--surface);border:1px solid var(--border);color:var(--muted);font-family:var(--font-mono);cursor:pointer}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
@@ -1295,22 +1314,67 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
     <button id="theme-btn" class="compare-mode-btn" onclick="toggleTheme()">☀</button>
     <button id="display-mode-btn" class="compare-mode-btn" onclick="toggleDisplayMode()">Token</button>
     <button id="compare-mode-btn" class="compare-mode-btn" onclick="toggleCompareMode()" style="display:none">Compare</button>
+    <button id="reset-toggle-btn" class="compare-mode-btn" onclick="toggleResetFiles()"></button>
     <div id="daily-pill"><span class="amt"></span> <span class="m"></span></div>
   </div>
   <div id="content"><div class="empty"></div></div>
 </div>
 
-<div id="refresh"></div>
+<div id="refresh"><span id="refresh-text"></span> <select id="refresh-interval" onchange="changeRefreshInterval(this.value)"><option value="5000">5s</option><option value="10000">10s</option><option value="30000">30s</option><option value="60000">60s</option></select></div>
 
 
 <script>
 let DATA = null;
 let selectedId = null;
 let openHbIdx  = null;
+let openHbKey  = null; // stable identifier (startTime) for the open heartbeat
 const expandedSteps = {};
+const expandedStepsKeys = {}; // maps startTime -> Set of expanded step indices
 let compareMode = false;
 let compareHbs = []; // [hbIdx1, hbIdx2]
+let compareHbKeys = []; // stable identifiers for compared heartbeats
 let agentOverviewOpen = true;
+const expandedFullIds = new Set(); // tracks expanded result/thinking element IDs
+let hbPage = 0;
+const HB_PAGE_SIZE = 20;
+let includeReset = localStorage.getItem('includeReset') === '1';
+let refreshMs = parseInt(localStorage.getItem('refreshMs')) || 5000;
+let refreshTimer = null;
+
+// Get a stable key for a heartbeat (startTime or fallback)
+function hbKey(hb) { return hb.startTime || null; }
+
+// After data refresh, remap index-based state to match new data order
+function remapHbIndices(agent) {
+  if (!agent || !agent.heartbeats) return;
+  const hbs = agent.heartbeats;
+
+  // Remap openHbIdx
+  if (openHbKey) {
+    const newIdx = hbs.findIndex(h => hbKey(h) === openHbKey);
+    openHbIdx = newIdx >= 0 ? newIdx : null;
+    if (openHbIdx === null) openHbKey = null;
+  }
+
+  // Remap expandedSteps: transfer from key-based store to index-based
+  const newExpanded = {};
+  for (let i = 0; i < hbs.length; i++) {
+    const k = hbKey(hbs[i]);
+    if (k && expandedStepsKeys[k]) {
+      newExpanded[i] = expandedStepsKeys[k];
+    }
+  }
+  // Clear and repopulate expandedSteps
+  for (const k of Object.keys(expandedSteps)) delete expandedSteps[k];
+  Object.assign(expandedSteps, newExpanded);
+
+  // Remap compareHbs
+  if (compareHbKeys.length) {
+    compareHbs = compareHbKeys.map(k => hbs.findIndex(h => hbKey(h) === k)).filter(i => i >= 0);
+    compareHbKeys = compareHbs.map(i => hbKey(hbs[i])).filter(Boolean);
+  }
+}
+
 let displayMode = localStorage.getItem('displayMode') || 'cost'; // 'cost' | 'token'
 let theme = localStorage.getItem('theme') || 'dark'; // 'dark' | 'light'
 if (theme === 'light') document.documentElement.classList.add('light');
@@ -1395,6 +1459,12 @@ const I18N = {
     other: 'Other',
     noActionsRecorded: 'No actions recorded',
     cleanupHeartbeats: '🗑 Cleanup heartbeats',
+    pageOf: '{cur} / {total}',
+    prevPage: '‹ Prev',
+    nextPage: 'Next ›',
+    resetFiles: 'Archive',
+    showFull: 'Show full',
+    collapse: 'Collapse',
     cleanupConfirm: 'Delete all {count} heartbeat sessions for {name}?\\n\\nThis cannot be undone.',
     today: 'Today',
     yesterday: 'Yesterday',
@@ -1410,7 +1480,7 @@ const I18N = {
     select1st: 'Select 1st',
     select2nd: 'Select 2nd',
     clear: 'Clear',
-    autoRefresh: '● auto-refresh 5s',
+    autoRefresh: '● auto-refresh',
     refreshed: '● refreshed',
     loading: '⟳ loading…',
     budget: 'Budget',
@@ -1510,6 +1580,12 @@ const I18N = {
     other: '其他',
     noActionsRecorded: '无操作记录',
     cleanupHeartbeats: '🗑 清理心跳',
+    pageOf: '{cur} / {total}',
+    prevPage: '‹ 上一页',
+    nextPage: '下一页 ›',
+    resetFiles: '归档',
+    showFull: '展开全部',
+    collapse: '收起',
     cleanupConfirm: '删除 {name} 的全部 {count} 条心跳会话？\\n\\n此操作不可撤销。',
     today: '今天',
     yesterday: '昨天',
@@ -1525,7 +1601,7 @@ const I18N = {
     select1st: '选择第1项',
     select2nd: '选择第2项',
     clear: '清除',
-    autoRefresh: '● 自动刷新 5秒',
+    autoRefresh: '● 自动刷新',
     refreshed: '● 已刷新',
     loading: '⟳ 加载中…',
     budget: '预算',
@@ -1679,7 +1755,7 @@ const fTk = n => { n = +n || 0; if (n >= 1e9) return (n/1e9).toFixed(1) + 'G'; i
 const dVal = (costVal, tokenVal) => displayMode === 'cost' ? costVal : tokenVal;
 const dFmt = (costVal, tokenVal) => displayMode === 'cost' ? f$(costVal) : fTk(tokenVal);
 const fN  = n => (+n||0).toLocaleString();
-const fT  = ts => ts ? new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+const fT  = ts => { if(!ts) return '—'; const d=new Date(ts); const mm=String(d.getMonth()+1).padStart(2,'0'); const dd=String(d.getDate()).padStart(2,'0'); const hh=String(d.getHours()).padStart(2,'0'); const mi=String(d.getMinutes()).padStart(2,'0'); const ss=String(d.getSeconds()).padStart(2,'0'); return mm+'-'+dd+' '+hh+':'+mi+':'+ss; };
 const fD  = ms => { if(!ms) return '—'; const s=Math.round(ms/1000); return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'; };
 const fmtSize = n => { if(!n) return '—'; if(n>=1000000) return (n/1000000).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(1)+'k'; return n.toString(); };
 const fAgo= ms => {
@@ -2448,8 +2524,43 @@ function renderAgent(a) {
         </div>
       </div>
     </div>
-    \${hbs.map((hb,i)=>heartbeatRow(hb,i,hbs.length)).join('')}
+    \${renderPager(hbs.length)}
+    \${hbs.slice(hbPage*HB_PAGE_SIZE, (hbPage+1)*HB_PAGE_SIZE).map((hb,si)=>{
+      const i = hbPage*HB_PAGE_SIZE + si;
+      return heartbeatRow(hb,i,hbs.length);
+    }).join('')}
+    \${hbs.length > HB_PAGE_SIZE ? renderPager(hbs.length) : ''}
   \`;
+}
+
+function renderPager(total) {
+  const pages = Math.ceil(total / HB_PAGE_SIZE);
+  if (pages <= 1) return '';
+  const cur = hbPage;
+  let nums = '';
+  for (let p = 0; p < pages; p++) {
+    // Show first, last, and pages near current
+    if (p === 0 || p === pages-1 || Math.abs(p - cur) <= 2) {
+      nums += \`<span class="pager-num \${p===cur?'active':''}" onclick="goPage(\${p})">\${p+1}</span>\`;
+    } else if (p === 1 || p === pages-2) {
+      nums += '<span style="color:var(--muted)">…</span>';
+    }
+  }
+  return \`<div class="pager">
+    <button class="pager-btn" onclick="goPage(\${cur-1})" \${cur<=0?'disabled':''}>\${t('prevPage')}</button>
+    \${nums}
+    <button class="pager-btn" onclick="goPage(\${cur+1})" \${cur>=pages-1?'disabled':''}>\${t('nextPage')}</button>
+    <span style="margin-left:6px">\${total} \${t('hb')}</span>
+  </div>\`;
+}
+
+function goPage(p) {
+  const a = DATA?.agents?.find(a=>a.id===selectedId);
+  if (!a) return;
+  const pages = Math.ceil(a.heartbeats.length / HB_PAGE_SIZE);
+  hbPage = Math.max(0, Math.min(p, pages-1));
+  renderAgent(a);
+  document.getElementById('content')?.scrollTo({top:0,behavior:'smooth'});
 }
 
 // ── Heartbeat row ──────────────────────────────────────────────────────────────
@@ -2652,10 +2763,13 @@ function stepDetail(s, hbIdx, hbId, stepIdx) {
   const thinkingText = s.text || '';
 
   // Thinking text section (if present)
+  const thinkingId = 'think-'+hbId+'-'+stepIdx;
+  const thinkExpanded = expandedFullIds.has(thinkingId);
   const thinkingHtml = thinkingText ? \`
     <div class="thinking-section">
       <div class="thinking-label">\${t('thinkingLabel')}</div>
-      <div class="thinking-text">\${esc(thinkingText)}</div>
+      <div class="thinking-text\${thinkExpanded?' expanded':''}" id="\${thinkingId}">\${esc(thinkingText)}</div>
+      \${thinkingText.length > 300 ? \`<button class="expand-btn" onclick="toggleExpand('\${thinkingId}',this)">\${thinkExpanded?t('collapse'):t('showFull')}</button>\` : ''}
     </div>
   \` : '';
 
@@ -2746,7 +2860,8 @@ function detailCard(tc, result, hbId, stepIdx, resultIdx) {
         <span class="b">\${fSz(result.size)}</span>
         \${errBadge}
       </div>
-      <div class="detail-result-body \${hasError && !isSolved?'r2':''}">\${esc(result.preview)}\${result.size>(result.preview||'').length?'<span class="m"> …('+fSz(result.size)+' total)</span>':''}</div>
+      <div class="detail-result-body \${hasError && !isSolved?'r2':''}\${expandedFullIds.has('res-'+hbId+'-'+stepIdx+'-'+resultIdx)?' expanded':''}" id="res-\${hbId}-\${stepIdx}-\${resultIdx}">\${expandedFullIds.has('res-'+hbId+'-'+stepIdx+'-'+resultIdx) && result.full ? esc(result.full) : esc(result.preview)+(result.full?'<span class="m"> …('+fSz(result.size)+' total)</span>':'')}</div>
+      \${result.full?\`<button class="expand-btn" onclick="toggleFullResult('\${hbId}',\${stepIdx},\${resultIdx})">\${expandedFullIds.has('res-'+hbId+'-'+stepIdx+'-'+resultIdx)?t('collapse'):t('showFull')}</button>\`:''}
     </div>\`;
   }
 
@@ -2825,7 +2940,8 @@ function toggleLang() {
   updateDailyPill();
   updateBudget();
   document.getElementById('sidebar-head').textContent = '🦞 ' + t('agents');
-  document.getElementById('refresh').textContent = t('autoRefresh');
+  document.getElementById('refresh-text').textContent = t('autoRefresh');
+  document.getElementById('reset-toggle-btn').textContent = t('resetFiles');
   document.getElementById('sidebar-toggle').title = t('toggleSidebar');
   document.getElementById('back-btn').title = t('backToOverview');
 }
@@ -2846,6 +2962,21 @@ function toggleDisplayMode() {
 }
 
 
+function changeRefreshInterval(val) {
+  refreshMs = parseInt(val) || 5000;
+  localStorage.setItem('refreshMs', refreshMs);
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(fetchData, refreshMs);
+}
+
+function toggleResetFiles() {
+  includeReset = !includeReset;
+  localStorage.setItem('includeReset', includeReset ? '1' : '0');
+  const btn = document.getElementById('reset-toggle-btn');
+  if (btn) btn.style.opacity = includeReset ? 1 : 0.5;
+  fetchData();
+}
+
 // ── URL hash navigation ───────────────────────────────────────────────────────
 function updateHash() {
   if (!selectedId) {
@@ -2860,8 +2991,11 @@ function updateHash() {
 function goHome(skipPush) {
   selectedId = null;
   openHbIdx = null;
+  openHbKey = null;
+  hbPage = 0;
   compareMode = false;
   compareHbs = [];
+  compareHbKeys = [];
   if (!skipPush) history.pushState(null, '', window.location.pathname);
   renderSidebar();
   document.getElementById('back-btn').style.display = 'none';
@@ -2890,6 +3024,8 @@ function restoreFromHash() {
     if (a) {
       selectedId = agent;
       openHbIdx = hb;
+      openHbKey = (hb !== null && a.heartbeats?.[hb]) ? hbKey(a.heartbeats[hb]) : null;
+      if (hb !== null) hbPage = Math.floor(hb / HB_PAGE_SIZE);
       document.getElementById('back-btn').style.display = '';
       renderSidebar();
       renderAgent(a);
@@ -3001,8 +3137,11 @@ function sortSteps(hbIdx, column) {
 function select(id) {
   selectedId = id;
   openHbIdx  = null;
+  openHbKey  = null;
+  hbPage     = 0;
   compareMode = false;
   compareHbs = [];
+  compareHbKeys = [];
   updateHash();
   renderSidebar();
   document.getElementById('back-btn').style.display = '';
@@ -3024,26 +3163,32 @@ function toggleAgentOverview() {
 }
 
 function toggleHb(i) {
+  const a = DATA?.agents?.find(a=>a.id===selectedId);
+  const hb = a?.heartbeats?.[i];
+
   if (compareMode) {
     // In compare mode: select heartbeats for comparison
     if (compareHbs.includes(i)) {
       compareHbs = compareHbs.filter(x => x !== i);
+      if (hb) compareHbKeys = compareHbKeys.filter(k => k !== hbKey(hb));
     } else if (compareHbs.length < 2) {
       compareHbs.push(i);
+      if (hb) compareHbKeys.push(hbKey(hb));
     }
-    if (!DATA) return;
-    const a = DATA.agents.find(a=>a.id===selectedId);
     if (a) renderAgent(a);
     return;
   }
 
   // Normal mode: toggle open/close
   openHbIdx = openHbIdx===i ? null : i;
+  openHbKey = openHbIdx !== null && hb ? hbKey(hb) : null;
+  // Navigate to the page containing this heartbeat
+  if (openHbIdx !== null) hbPage = Math.floor(openHbIdx / HB_PAGE_SIZE);
   updateHash();
   if (!expandedSteps[i]) expandedSteps[i] = new Set();
-  if (!DATA) return;
-  const a = DATA.agents.find(a=>a.id===selectedId);
-  if (a) renderAgent(a);
+  if (hb && hbKey(hb) && !expandedStepsKeys[hbKey(hb)]) expandedStepsKeys[hbKey(hb)] = expandedSteps[i];
+  if (!a) return;
+  renderAgent(a);
   if (openHbIdx !== null)
     setTimeout(()=>document.getElementById('hb'+i)?.scrollIntoView({behavior:'smooth',block:'nearest'}),50);
 }
@@ -3053,10 +3198,13 @@ function toggleStep(hbIdx, stepIdx) {
   const set = expandedSteps[hbIdx];
   if (set.has(stepIdx)) set.delete(stepIdx); else set.add(stepIdx);
 
+  // Sync to key-based store
   if (!DATA) return;
   const a    = DATA.agents.find(a=>a.id===selectedId);
   const hb   = a?.heartbeats?.[hbIdx];
   if (!hb) return;
+  const k = hbKey(hb);
+  if (k) expandedStepsKeys[k] = set;
   const hbId    = hb.startTime || hbIdx;
   const steps   = hb.steps||[];
   const costs   = steps.map(s=>s.cost||0);
@@ -3064,6 +3212,37 @@ function toggleStep(hbIdx, stepIdx) {
   const maxStep = Math.max(...costs,1e-9);
   const tbody = document.getElementById('steps-'+hbIdx);
   if (tbody) tbody.innerHTML = steps.map((s,si)=>stepRows(s,si,hbIdx,hbId,maxStep,avgCost,set)).join('');
+}
+
+function toggleExpand(elId, btn) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const expanded = el.classList.toggle('expanded');
+  if (expanded) expandedFullIds.add(elId); else expandedFullIds.delete(elId);
+  if (btn) btn.textContent = expanded ? t('collapse') : t('showFull');
+}
+
+function toggleFullResult(hbId, stepIdx, resultIdx) {
+  const elId = 'res-'+hbId+'-'+stepIdx+'-'+resultIdx;
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const btn = el.parentElement.querySelector('.expand-btn');
+  const isExpanded = el.classList.toggle('expanded');
+  if (isExpanded) {
+    expandedFullIds.add(elId);
+    const a = DATA?.agents?.find(a=>a.id===selectedId);
+    const hb = a?.heartbeats?.find(h => (h.startTime||'') === hbId);
+    const result = hb?.steps?.[stepIdx]?.toolResults?.[resultIdx];
+    if (result?.full) el.textContent = result.full;
+    if (btn) btn.textContent = t('collapse');
+  } else {
+    expandedFullIds.delete(elId);
+    const a = DATA?.agents?.find(a=>a.id===selectedId);
+    const hb = a?.heartbeats?.find(h => (h.startTime||'') === hbId);
+    const result = hb?.steps?.[stepIdx]?.toolResults?.[resultIdx];
+    if (result) el.innerHTML = esc(result.preview) + '<span class="m"> …(' + fSz(result.size) + ' total)</span>';
+    if (btn) btn.textContent = t('showFull');
+  }
 }
 
 // ── Cleanup heartbeats ───────────────────────────────────────────────────────
@@ -3117,15 +3296,22 @@ function updateBudget() {
 // ── Data fetching ──────────────────────────────────────────────────────────────
 async function fetchData() {
   const el = document.getElementById('refresh');
-  el.className = 'spin'; el.textContent = t('loading');
+  const txt = document.getElementById('refresh-text');
+  el.className = 'spin'; txt.textContent = t('loading');
   try {
-    const r = await fetch('/api/data');
+    const r = await fetch('/api/data' + (includeReset ? '?include_reset=1' : ''));
     if (!r.ok) throw new Error('HTTP '+r.status);
     DATA = await r.json();
 
     // Recalculate error counts for all agents, excluding solved errors
     for (const agent of DATA.agents || []) {
       recalculateErrorCounts(agent);
+    }
+
+    // Remap index-based state to match potentially reordered heartbeats
+    if (selectedId) {
+      const cur = DATA.agents.find(a=>a.id===selectedId);
+      if (cur) remapHbIndices(cur);
     }
 
     renderSidebar();
@@ -3143,10 +3329,10 @@ async function fetchData() {
       document.getElementById('content').innerHTML = renderCrossAgentView();
     }
     el.className = '';
-    el.textContent = t('refreshed')+' '+new Date().toLocaleTimeString();
+    txt.textContent = t('refreshed')+' '+new Date().toLocaleTimeString();
   } catch(e) {
     el.className = '';
-    el.textContent = '✕ '+e.message;
+    txt.textContent = '✕ '+e.message;
   }
 }
 
@@ -3154,15 +3340,18 @@ async function fetchData() {
 document.getElementById('display-mode-btn').textContent = displayMode === 'cost' ? 'Token' : 'Cost';
 document.getElementById('theme-btn').textContent = theme === 'dark' ? '☀' : '☾';
 document.getElementById('lang-btn').textContent = lang === 'en' ? '中' : 'EN';
+document.getElementById('reset-toggle-btn').textContent = t('resetFiles');
+document.getElementById('reset-toggle-btn').style.opacity = includeReset ? 1 : 0.5;
 document.getElementById('sidebar-head').textContent = '🦞 ' + t('agents');
-document.getElementById('refresh').textContent = t('autoRefresh');
+document.getElementById('refresh-text').textContent = t('autoRefresh');
+document.getElementById('refresh-interval').value = refreshMs;
 document.querySelector('#content .empty').textContent = t('selectAgent');
 document.getElementById('sidebar-toggle').title = t('toggleSidebar');
 document.getElementById('back-btn').title = t('backToOverview');
 document.getElementById('agent-title').textContent = t('openclawTrace');
 
 fetchData();
-setInterval(fetchData, 5000);
+refreshTimer = setInterval(fetchData, refreshMs);
 
 // Handle browser back/forward
 window.addEventListener('popstate', () => {
