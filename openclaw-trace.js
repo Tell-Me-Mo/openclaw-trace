@@ -67,9 +67,11 @@ function getAgentMeta() {
 }
 
 function extractText(msg) {
-  if (typeof msg.content === 'string') return msg.content.slice(0, 140);
-  if (!Array.isArray(msg.content)) return '';
-  return msg.content.filter(c => c.type === 'text').map(c => c.text || '').join('').slice(0, 140);
+  let full;
+  if (typeof msg.content === 'string') full = msg.content;
+  else if (!Array.isArray(msg.content)) return '';
+  else full = msg.content.filter(c => c.type === 'text').map(c => c.text || '').join('');
+  return full;
 }
 
 function extractToolCalls(msg) {
@@ -142,6 +144,7 @@ function attachToolResult(step, msg) {
     callId:  msg.toolCallId || '',
     size,
     preview: text.slice(0, 500),
+    full:    size > 500 ? text : null,
     isError: msg.isError || false,
   });
   step.resultTotalSize = (step.resultTotalSize || 0) + size;
@@ -172,7 +175,7 @@ function parseHeartbeats(entries) {
             cur.steps[cur.steps.length - 1].toolResults = cur.steps[cur.steps.length - 1].toolResults || [];
             cur.steps[cur.steps.length - 1].toolResults.push({
               name: c.toolName || '?', callId: c.toolCallId || '',
-              size: text.length, preview: text.slice(0, 500), isError: c.isError || false,
+              size: text.length, preview: text.slice(0, 500), full: text.length > 500 ? text : null, isError: c.isError || false,
             });
             cur.steps[cur.steps.length - 1].resultTotalSize =
               (cur.steps[cur.steps.length - 1].resultTotalSize || 0) + text.length;
@@ -1169,12 +1172,16 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 .thinking-section{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:8px}
 .thinking-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
 .thinking-text{font-size:11px;color:var(--text);line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
+.thinking-text.expanded{max-height:none}
 .detail-call{flex:1;min-width:220px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;font-size:11px}
 .detail-call-head{font-size:11px;font-weight:600;color:var(--blue);margin-bottom:6px;display:flex;justify-content:space-between}
 .detail-call-args{color:var(--muted);margin-bottom:8px;word-break:break-all;white-space:pre-wrap;max-height:80px;overflow-y:auto;font-family:var(--font-mono);font-size:10px}
 .detail-result{border-top:1px solid var(--border);padding-top:6px;margin-top:4px}
 .detail-result-head{font-size:10px;color:var(--muted);margin-bottom:3px;display:flex;gap:6px;align-items:center}
 .detail-result-body{color:var(--text);white-space:pre-wrap;word-break:break-all;max-height:120px;overflow-y:auto;font-size:10px;opacity:.85;font-family:var(--font-mono)}
+.detail-result-body.expanded{max-height:none}
+.expand-btn{font-size:9px;padding:2px 8px;margin-top:4px;border-radius:3px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .15s}
+.expand-btn:hover{background:var(--surface3);color:var(--text)}
 .err-badge{color:var(--red);font-size:9px;background:var(--red)14;padding:2px 6px;border-radius:4px;font-weight:600}
 .err-badge-solved{color:var(--muted);font-size:9px;background:var(--surface2);padding:2px 6px;border-radius:4px}
 .mark-solved-btn{font-size:9px;padding:3px 8px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px;transition:all .12s}
@@ -1327,6 +1334,7 @@ let compareMode = false;
 let compareHbs = []; // [hbIdx1, hbIdx2]
 let compareHbKeys = []; // stable identifiers for compared heartbeats
 let agentOverviewOpen = true;
+const expandedFullIds = new Set(); // tracks expanded result/thinking element IDs
 let hbPage = 0;
 const HB_PAGE_SIZE = 20;
 let includeReset = localStorage.getItem('includeReset') === '1';
@@ -1455,6 +1463,8 @@ const I18N = {
     prevPage: '‹ Prev',
     nextPage: 'Next ›',
     resetFiles: 'Archive',
+    showFull: 'Show full',
+    collapse: 'Collapse',
     cleanupConfirm: 'Delete all {count} heartbeat sessions for {name}?\\n\\nThis cannot be undone.',
     today: 'Today',
     yesterday: 'Yesterday',
@@ -1574,6 +1584,8 @@ const I18N = {
     prevPage: '‹ 上一页',
     nextPage: '下一页 ›',
     resetFiles: '归档',
+    showFull: '展开全部',
+    collapse: '收起',
     cleanupConfirm: '删除 {name} 的全部 {count} 条心跳会话？\\n\\n此操作不可撤销。',
     today: '今天',
     yesterday: '昨天',
@@ -2751,10 +2763,13 @@ function stepDetail(s, hbIdx, hbId, stepIdx) {
   const thinkingText = s.text || '';
 
   // Thinking text section (if present)
+  const thinkingId = 'think-'+hbId+'-'+stepIdx;
+  const thinkExpanded = expandedFullIds.has(thinkingId);
   const thinkingHtml = thinkingText ? \`
     <div class="thinking-section">
       <div class="thinking-label">\${t('thinkingLabel')}</div>
-      <div class="thinking-text">\${esc(thinkingText)}</div>
+      <div class="thinking-text\${thinkExpanded?' expanded':''}" id="\${thinkingId}">\${esc(thinkingText)}</div>
+      \${thinkingText.length > 300 ? \`<button class="expand-btn" onclick="toggleExpand('\${thinkingId}',this)">\${thinkExpanded?t('collapse'):t('showFull')}</button>\` : ''}
     </div>
   \` : '';
 
@@ -2845,7 +2860,8 @@ function detailCard(tc, result, hbId, stepIdx, resultIdx) {
         <span class="b">\${fSz(result.size)}</span>
         \${errBadge}
       </div>
-      <div class="detail-result-body \${hasError && !isSolved?'r2':''}">\${esc(result.preview)}\${result.size>(result.preview||'').length?'<span class="m"> …('+fSz(result.size)+' total)</span>':''}</div>
+      <div class="detail-result-body \${hasError && !isSolved?'r2':''}\${expandedFullIds.has('res-'+hbId+'-'+stepIdx+'-'+resultIdx)?' expanded':''}" id="res-\${hbId}-\${stepIdx}-\${resultIdx}">\${expandedFullIds.has('res-'+hbId+'-'+stepIdx+'-'+resultIdx) && result.full ? esc(result.full) : esc(result.preview)+(result.full?'<span class="m"> …('+fSz(result.size)+' total)</span>':'')}</div>
+      \${result.full?\`<button class="expand-btn" onclick="toggleFullResult('\${hbId}',\${stepIdx},\${resultIdx})">\${expandedFullIds.has('res-'+hbId+'-'+stepIdx+'-'+resultIdx)?t('collapse'):t('showFull')}</button>\`:''}
     </div>\`;
   }
 
@@ -3196,6 +3212,37 @@ function toggleStep(hbIdx, stepIdx) {
   const maxStep = Math.max(...costs,1e-9);
   const tbody = document.getElementById('steps-'+hbIdx);
   if (tbody) tbody.innerHTML = steps.map((s,si)=>stepRows(s,si,hbIdx,hbId,maxStep,avgCost,set)).join('');
+}
+
+function toggleExpand(elId, btn) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const expanded = el.classList.toggle('expanded');
+  if (expanded) expandedFullIds.add(elId); else expandedFullIds.delete(elId);
+  if (btn) btn.textContent = expanded ? t('collapse') : t('showFull');
+}
+
+function toggleFullResult(hbId, stepIdx, resultIdx) {
+  const elId = 'res-'+hbId+'-'+stepIdx+'-'+resultIdx;
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const btn = el.parentElement.querySelector('.expand-btn');
+  const isExpanded = el.classList.toggle('expanded');
+  if (isExpanded) {
+    expandedFullIds.add(elId);
+    const a = DATA?.agents?.find(a=>a.id===selectedId);
+    const hb = a?.heartbeats?.find(h => (h.startTime||'') === hbId);
+    const result = hb?.steps?.[stepIdx]?.toolResults?.[resultIdx];
+    if (result?.full) el.textContent = result.full;
+    if (btn) btn.textContent = t('collapse');
+  } else {
+    expandedFullIds.delete(elId);
+    const a = DATA?.agents?.find(a=>a.id===selectedId);
+    const hb = a?.heartbeats?.find(h => (h.startTime||'') === hbId);
+    const result = hb?.steps?.[stepIdx]?.toolResults?.[resultIdx];
+    if (result) el.innerHTML = esc(result.preview) + '<span class="m"> …(' + fSz(result.size) + ' total)</span>';
+    if (btn) btn.textContent = t('showFull');
+  }
 }
 
 // ── Cleanup heartbeats ───────────────────────────────────────────────────────
