@@ -41,6 +41,104 @@ const os   = require('os');
 
 const PORT = 3141;
 const OC   = process.env.OPENCLAW_STATE_DIR || process.env.OPENCLAW_HOME || path.join(os.homedir(), '.openclaw');
+const SHADOW_DIR = path.join(OC, '.openclaw-trace-shadow');
+
+// ── Session file watcher (preserves heartbeats truncated by OpenClaw) ────────
+
+try { fs.mkdirSync(SHADOW_DIR, { recursive: true }); } catch {}
+
+// Track known file content so we can detect truncation
+const fileSnapshots = {}; // filePath -> { lines: number, content: string }
+
+function snapshotFile(filePath) {
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const lines = content.trim() ? content.trim().split('\n').length : 0;
+    fileSnapshots[filePath] = { lines, content };
+  } catch {}
+}
+
+function onFileChanged(filePath) {
+  try {
+    const newContent = fs.readFileSync(filePath, 'utf8');
+    const newLines = newContent.trim() ? newContent.trim().split('\n').length : 0;
+    const prev = fileSnapshots[filePath];
+
+    if (prev && newLines < prev.lines) {
+      // File was truncated — save the removed entries
+      const prevArr = prev.content.trim().split('\n');
+      const newArr = newContent.trim() ? newContent.trim().split('\n') : [];
+      // The truncated entries are lines that existed before but are gone now
+      // OpenClaw resets to the pre-heartbeat state, so removed = prevArr[newArr.length..]
+      const removed = prevArr.slice(newArr.length);
+      if (removed.length > 0) {
+        const agentId = filePath.split(path.sep + 'agents' + path.sep)[1]?.split(path.sep)[0];
+        if (agentId) saveShadowEntries(agentId, filePath, removed);
+      }
+    }
+    fileSnapshots[filePath] = { lines: newLines, content: newContent };
+  } catch {}
+}
+
+function saveShadowEntries(agentId, sourceFile, lines) {
+  const shadowFile = path.join(SHADOW_DIR, agentId + '.jsonl');
+  try {
+    // Deduplicate: check if these entries already exist in shadow
+    const existing = new Set();
+    try {
+      const prev = fs.readFileSync(shadowFile, 'utf8').trim();
+      if (prev) prev.split('\n').forEach(l => existing.add(l));
+    } catch {}
+    const newLines = lines.filter(l => !existing.has(l));
+    if (newLines.length > 0) {
+      fs.appendFileSync(shadowFile, newLines.join('\n') + '\n');
+    }
+  } catch {}
+}
+
+// Watch all agent session directories for JSONL changes
+const watchers = {};
+function startWatching() {
+  const agentsDir = path.join(OC, 'agents');
+  try {
+    const agents = fs.readdirSync(agentsDir);
+    for (const agent of agents) {
+      const sessDir = path.join(agentsDir, agent, 'sessions');
+      watchSessionDir(sessDir);
+    }
+  } catch {}
+  // Also watch the agents dir for new agents
+  try {
+    fs.watch(agentsDir, (ev, filename) => {
+      if (filename) {
+        const sessDir = path.join(agentsDir, filename, 'sessions');
+        watchSessionDir(sessDir);
+      }
+    });
+  } catch {}
+}
+
+function watchSessionDir(sessDir) {
+  if (watchers[sessDir]) return;
+  try {
+    // Snapshot existing JSONL files
+    const files = fs.readdirSync(sessDir);
+    for (const file of files) {
+      if (file.endsWith('.jsonl')) {
+        snapshotFile(path.join(sessDir, file));
+      }
+    }
+    // Watch for changes
+    watchers[sessDir] = fs.watch(sessDir, (ev, filename) => {
+      if (filename && filename.endsWith('.jsonl')) {
+        const filePath = path.join(sessDir, filename);
+        if (fs.existsSync(filePath)) onFileChanged(filePath);
+      }
+    });
+  } catch {}
+}
+
+startWatching();
 
 // ── Data ──────────────────────────────────────────────────────────────────────
 
@@ -566,6 +664,12 @@ function loadAll(opts = {}) {
       // Directory doesn't exist or can't be read
     }
 
+    // Include shadow file with preserved (truncated) heartbeat entries
+    const shadowFile = path.join(SHADOW_DIR, id + '.jsonl');
+    if (fs.existsSync(shadowFile)) {
+      allSessionFiles.push(shadowFile);
+    }
+
     // Prefer registered sessions for metadata
     for (const sess of Object.values(sessions)) {
       if (!sess.sessionFile) continue;
@@ -578,35 +682,44 @@ function loadAll(opts = {}) {
     // Parse all session files
     for (const sessionFile of allSessionFiles) {
       const hbs = parseHeartbeats(readJSONL(sessionFile), sessionFile);
-      for (const hb of hbs) {
-        totalCost   += hb.totalCost;
-        totalTokensSum += hb.totalTokensSum || 0;
-        totalErrors += hb.errorCount || 0;
-        totalCacheReadTk += hb.totalCacheRead || 0;
-        totalInputTk += hb.totalInput || 0;
-        heartbeats.push(hb);
+      for (const hb of hbs) heartbeats.push(hb);
+    }
 
-        // Daily rollup
-        if (hb.startTime) {
-          const d = new Date(hb.startTime);
-          const dateKey = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-          dailyCosts[dateKey] = (dailyCosts[dateKey] || 0) + hb.totalCost;
-          dailyTokens[dateKey] = (dailyTokens[dateKey] || 0) + (hb.totalTokensSum || 0);
-          dailyHbs[dateKey]   = (dailyHbs[dateKey] || 0) + 1;
-          if (!dailyByAgent[dateKey]) dailyByAgent[dateKey] = {};
-          dailyByAgent[dateKey][id] = (dailyByAgent[dateKey][id] || 0) + hb.totalCost;
-        }
+    // Deduplicate heartbeats (shadow file may overlap with live file during active runs)
+    const seen = new Set();
+    const uniqueHbs = [];
+    heartbeats.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+    for (const hb of heartbeats) {
+      const key = hb.startTime || '';
+      if (key && seen.has(key)) continue;
+      if (key) seen.add(key);
+      uniqueHbs.push(hb);
+    }
+
+    // Compute totals and daily rollup from deduplicated heartbeats
+    for (const hb of uniqueHbs) {
+      totalCost   += hb.totalCost;
+      totalTokensSum += hb.totalTokensSum || 0;
+      totalErrors += hb.errorCount || 0;
+      totalCacheReadTk += hb.totalCacheRead || 0;
+      totalInputTk += hb.totalInput || 0;
+      if (hb.startTime) {
+        const d = new Date(hb.startTime);
+        const dateKey = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+        dailyCosts[dateKey] = (dailyCosts[dateKey] || 0) + hb.totalCost;
+        dailyTokens[dateKey] = (dailyTokens[dateKey] || 0) + (hb.totalTokensSum || 0);
+        dailyHbs[dateKey]   = (dailyHbs[dateKey] || 0) + 1;
+        if (!dailyByAgent[dateKey]) dailyByAgent[dateKey] = {};
+        dailyByAgent[dateKey][id] = (dailyByAgent[dateKey][id] || 0) + hb.totalCost;
       }
     }
 
-    heartbeats.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
-
     // Average cache hit rate
-    const avgCacheHit = heartbeats.length
-      ? heartbeats.reduce((sum, hb) => sum + (hb.cacheHitRate || 0), 0) / heartbeats.length
+    const avgCacheHit = uniqueHbs.length
+      ? uniqueHbs.reduce((sum, hb) => sum + (hb.cacheHitRate || 0), 0) / uniqueHbs.length
       : 0;
 
-    agents.push({ ...info, model, contextTokens, totalTokens, totalCost, totalTokensSum, totalErrors, lastTime, heartbeats, avgCacheHit, totalCacheReadTk, totalInputTk });
+    agents.push({ ...info, model, contextTokens, totalTokens, totalCost, totalTokensSum, totalErrors, lastTime, heartbeats: uniqueHbs, avgCacheHit, totalCacheReadTk, totalInputTk });
   }
 
   agents.sort((a, b) => (b.lastTime || 0) - (a.lastTime || 0));
@@ -1004,6 +1117,9 @@ http.createServer(async (req, res) => {
           if (fs.existsSync(sessFile)) {
             fs.writeFileSync(sessFile, '{}');
           }
+          // Clean up shadow file
+          const shadowFile = path.join(SHADOW_DIR, id + '.jsonl');
+          try { fs.unlinkSync(shadowFile); } catch {}
         } catch (e) {
           // Directory doesn't exist or permission error
         }
