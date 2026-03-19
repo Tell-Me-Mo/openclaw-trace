@@ -150,11 +150,12 @@ function attachToolResult(step, msg) {
   step.resultTotalSize = (step.resultTotalSize || 0) + size;
 }
 
-function parseHeartbeats(entries) {
+function parseHeartbeats(entries, sessionFile) {
   const runs = [];
   let cur = null;
 
-  for (const e of entries) {
+  for (let ei = 0; ei < entries.length; ei++) {
+    const e = entries[ei];
     const msg = e.message;
     if (!msg?.role) continue;
 
@@ -184,7 +185,10 @@ function parseHeartbeats(entries) {
         continue;
       }
 
-      if (cur?.steps?.length) runs.push(finalizeRun(cur));
+      if (cur) {
+        cur.entryRange.end = ei - 1;
+        if (cur.steps?.length || cur.apiErrors > 0) runs.push(finalizeRun(cur));
+      }
       cur = {
         startTime:    e.timestamp || msg.timestamp || null,
         endTime:      null,
@@ -196,6 +200,8 @@ function parseHeartbeats(entries) {
         totalOutput:  0,
         finalContext: 0,
         summary:      '',
+        sessionFile:  sessionFile || null,
+        entryRange:   { start: ei, end: null },
       };
       continue;
     }
@@ -240,9 +246,9 @@ function parseHeartbeats(entries) {
       }
     }
   }
-  if (cur?.steps?.length) runs.push(finalizeRun(cur));
+  if (cur?.steps?.length) { cur.entryRange.end = entries.length - 1; runs.push(finalizeRun(cur)); }
   // Also push runs with only API errors (no successful steps)
-  if (cur && !cur.steps.length && cur.apiErrors > 0) runs.push(finalizeRun(cur));
+  if (cur && !cur.steps.length && cur.apiErrors > 0) { cur.entryRange.end = entries.length - 1; runs.push(finalizeRun(cur)); }
   return runs.reverse();
 }
 
@@ -511,8 +517,9 @@ function cleanHeartbeatForAPI(hb, errorsOnly = false) {
     );
   }
 
+  const { sessionFile, entryRange, ...rest } = hb;
   return {
-    ...hb,
+    ...rest,
     steps,
     ...(errorsOnly && { filteredToErrors: true, totalSteps: hb.steps?.length || 0 }),
   };
@@ -567,7 +574,7 @@ function loadAll(opts = {}) {
 
     // Parse all session files
     for (const sessionFile of allSessionFiles) {
-      const hbs = parseHeartbeats(readJSONL(sessionFile));
+      const hbs = parseHeartbeats(readJSONL(sessionFile), sessionFile);
       for (const hb of hbs) {
         totalCost   += hb.totalCost;
         totalTokensSum += hb.totalTokensSum || 0;
@@ -825,6 +832,51 @@ http.createServer(async (req, res) => {
       const heartbeat = cleanHeartbeatForAPI(agent.heartbeats[index], errorsOnly);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(heartbeat, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/raw-messages?agent=X&hb=N - Get raw JSONL entries for a specific heartbeat
+  if (url === '/api/raw-messages') {
+    try {
+      const agentId = params.get('agent');
+      const hbIdx = parseInt(params.get('hb') || '0', 10);
+      if (!agentId) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'agent parameter required' }));
+        return;
+      }
+      const data = loadAll();
+      const agent = data.agents.find(a => a.id === agentId);
+      if (!agent || !agent.heartbeats?.length) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'No heartbeats found for agent' }));
+        return;
+      }
+      if (hbIdx < 0 || hbIdx >= agent.heartbeats.length) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: `Heartbeat index ${hbIdx} out of range` }));
+        return;
+      }
+      const hb = agent.heartbeats[hbIdx];
+      if (!hb.sessionFile || !hb.entryRange) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Session file info not available for this heartbeat' }));
+        return;
+      }
+      const allEntries = readJSONL(hb.sessionFile);
+      const slice = allEntries.slice(hb.entryRange.start, hb.entryRange.end + 1);
+      const messages = slice.map((entry, i) => ({
+        index: hb.entryRange.start + i,
+        role: entry.message?.role || entry.type || 'unknown',
+        timestamp: entry.timestamp || entry.message?.timestamp || null,
+        raw: entry,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ heartbeatIndex: hbIdx, messages }, null, 2));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
@@ -1289,6 +1341,25 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 ::-webkit-scrollbar-thumb:hover{background:var(--border-light)}
 .thinking-cell:hover{background:var(--surface2)22}
 
+.raw-messages-btn{font-size:11px;padding:3px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface2);cursor:pointer;color:var(--fg);margin-bottom:8px;display:inline-block}
+.raw-messages-btn:hover{background:var(--surface3)}
+.raw-messages-panel{margin-top:12px;border-top:1px solid var(--border);padding-top:12px}
+.raw-msg-card{margin:4px 0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.raw-msg-head{padding:6px 10px;display:flex;gap:8px;align-items:center;cursor:pointer;font-size:11px;background:var(--surface2);user-select:none}
+.raw-msg-head:hover{background:var(--surface3)}
+.raw-msg-body{display:none;padding:8px}
+.raw-msg-body.open{display:block}
+.raw-msg-body pre{margin:0;white-space:pre-wrap;word-break:break-all;font-size:10px;max-height:400px;overflow:auto;background:var(--surface3);padding:8px;border-radius:4px;color:var(--fg)}
+.raw-role{padding:1px 6px;border-radius:3px;font-weight:600;font-size:10px;color:#fff}
+.raw-role-user{background:var(--blue)}
+.raw-role-assistant{background:var(--green)}
+.raw-role-toolResult{background:var(--orange)}
+.raw-role-unknown{background:var(--border)}
+.raw-msg-actions{margin-left:auto;display:flex;gap:4px}
+.raw-msg-actions button{font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--surface);cursor:pointer;color:var(--fg)}
+.raw-msg-actions button:hover{background:var(--surface3)}
+.raw-panel-actions{margin-bottom:8px;display:flex;gap:6px}
+
 </style>
 </head>
 <body>
@@ -1330,6 +1401,8 @@ let openHbIdx  = null;
 let openHbKey  = null; // stable identifier (startTime) for the open heartbeat
 const expandedSteps = {};
 const expandedStepsKeys = {}; // maps startTime -> Set of expanded step indices
+const rawPanelOpen = {};      // hbIdx -> true if raw panel is open
+const rawPanelOpenKeys = {};  // startTime -> true if raw panel is open
 let compareMode = false;
 let compareHbs = []; // [hbIdx1, hbIdx2]
 let compareHbKeys = []; // stable identifiers for compared heartbeats
@@ -1367,6 +1440,15 @@ function remapHbIndices(agent) {
   // Clear and repopulate expandedSteps
   for (const k of Object.keys(expandedSteps)) delete expandedSteps[k];
   Object.assign(expandedSteps, newExpanded);
+
+  // Remap rawPanelOpen
+  const newRawOpen = {};
+  for (let i = 0; i < hbs.length; i++) {
+    const k = hbKey(hbs[i]);
+    if (k && rawPanelOpenKeys[k]) newRawOpen[i] = true;
+  }
+  for (const k of Object.keys(rawPanelOpen)) delete rawPanelOpen[k];
+  Object.assign(rawPanelOpen, newRawOpen);
 
   // Remap compareHbs
   if (compareHbKeys.length) {
@@ -1465,6 +1547,12 @@ const I18N = {
     resetFiles: 'Archive',
     showFull: 'Show full',
     collapse: 'Collapse',
+    rawMessages: 'Raw Messages',
+    rawMessagesHide: 'Hide Raw',
+    expandJson: 'Expand',
+    collapseJson: 'Collapse',
+    copyJson: 'Copy JSON',
+    copyAllJson: 'Copy All',
     cleanupConfirm: 'Delete all {count} heartbeat sessions for {name}?\\n\\nThis cannot be undone.',
     today: 'Today',
     yesterday: 'Yesterday',
@@ -1586,6 +1674,12 @@ const I18N = {
     resetFiles: '归档',
     showFull: '展开全部',
     collapse: '收起',
+    rawMessages: '原始消息',
+    rawMessagesHide: '隐藏原始',
+    expandJson: '展开',
+    collapseJson: '收起',
+    copyJson: '复制 JSON',
+    copyAllJson: '复制全部',
     cleanupConfirm: '删除 {name} 的全部 {count} 条心跳会话？\\n\\n此操作不可撤销。',
     today: '今天',
     yesterday: '昨天',
@@ -2531,6 +2625,16 @@ function renderAgent(a) {
     }).join('')}
     \${hbs.length > HB_PAGE_SIZE ? renderPager(hbs.length) : ''}
   \`;
+  // Restore raw message panels that were open before re-render
+  setTimeout(() => {
+    for (const idx of Object.keys(rawPanelOpen)) {
+      const cacheKey = selectedId + ':' + idx;
+      const panel = document.getElementById('raw-panel-' + idx);
+      if (panel && rawMessageCache[cacheKey]) {
+        renderRawMessages(panel, rawMessageCache[cacheKey], parseInt(idx));
+      }
+    }
+  }, 0);
 }
 
 function renderPager(total) {
@@ -2642,6 +2746,8 @@ function heartbeatBody(hb, hbIdx) {
   \` : '';
 
   return \`
+    <button class="raw-messages-btn" onclick="toggleRawMessages(\${hbIdx})">\${rawPanelOpen[hbIdx] ? t('rawMessagesHide') : t('rawMessages')}</button>
+    <div id="raw-panel-\${hbIdx}" class="raw-messages-panel" style="display:\${rawPanelOpen[hbIdx] ? 'block' : 'none'}"></div>
     \${wasteHtml}
     <div class="hb-stats-grid">
       <div class="stat-chart-card">
@@ -3243,6 +3349,98 @@ function toggleFullResult(hbId, stepIdx, resultIdx) {
     if (result) el.innerHTML = esc(result.preview) + '<span class="m"> …(' + fSz(result.size) + ' total)</span>';
     if (btn) btn.textContent = t('showFull');
   }
+}
+
+// ── Raw messages viewer ─────────────────────────────────────────────────────
+const rawMessageCache = {};
+
+async function toggleRawMessages(hbIdx) {
+  const panel = document.getElementById('raw-panel-' + hbIdx);
+  if (!panel) return;
+  const agent = DATA?.agents?.find(a => a.id === selectedId);
+  const hb = agent?.heartbeats?.[hbIdx];
+  const k = hb ? hbKey(hb) : null;
+  if (panel.style.display !== 'none') {
+    panel.style.display = 'none';
+    delete rawPanelOpen[hbIdx];
+    if (k) delete rawPanelOpenKeys[k];
+    return;
+  }
+  panel.style.display = 'block';
+  rawPanelOpen[hbIdx] = true;
+  if (k) rawPanelOpenKeys[k] = true;
+  const cacheKey = selectedId + ':' + hbIdx;
+  if (rawMessageCache[cacheKey]) {
+    renderRawMessages(panel, rawMessageCache[cacheKey], hbIdx);
+    return;
+  }
+  panel.innerHTML = '<div class="m" style="padding:8px">Loading...</div>';
+  try {
+    const resp = await fetch('/api/raw-messages?agent=' + encodeURIComponent(selectedId) + '&hb=' + hbIdx);
+    const data = await resp.json();
+    if (data.error) { panel.innerHTML = '<div class="m" style="padding:8px;color:var(--red)">Error: ' + esc(data.error) + '</div>'; return; }
+    rawMessageCache[cacheKey] = data;
+    renderRawMessages(panel, data, hbIdx);
+  } catch (e) {
+    panel.innerHTML = '<div class="m" style="padding:8px;color:var(--red)">Failed to load: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderRawMessages(panel, data, hbIdx) {
+  const msgs = data.messages || [];
+  let html = '<div class="raw-panel-actions">';
+  html += '<button class="raw-messages-btn" onclick="copyAllRawMessages(' + hbIdx + ')">' + t('copyAllJson') + '</button>';
+  html += '</div>';
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    const role = m.role || 'unknown';
+    const roleCls = 'raw-role raw-role-' + (role === 'user' || role === 'assistant' || role === 'toolResult' ? role : 'unknown');
+    const ts = m.timestamp ? fT(m.timestamp) : '';
+    const preview = getRawPreview(m.raw);
+    html += '<div class="raw-msg-card">';
+    html += '<div class="raw-msg-head" onclick="toggleRawMsgBody(&quot;raw-body-' + hbIdx + '-' + i + '&quot;)">';
+    html += '<span class="' + roleCls + '">' + esc(role) + '</span>';
+    html += '<span class="m">' + esc(ts) + '</span>';
+    html += '<span class="m" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(preview) + '</span>';
+    html += '<div class="raw-msg-actions"><button onclick="event.stopPropagation();copyRawMessage(' + hbIdx + ',' + i + ')">' + t('copyJson') + '</button></div>';
+    html += '</div>';
+    html += '<div class="raw-msg-body" id="raw-body-' + hbIdx + '-' + i + '"><pre>' + esc(JSON.stringify(m.raw, null, 2)) + '</pre></div>';
+    html += '</div>';
+  }
+  panel.innerHTML = html;
+}
+
+function getRawPreview(raw) {
+  const msg = raw?.message;
+  if (!msg) return '';
+  if (typeof msg.content === 'string') return msg.content.slice(0, 120);
+  if (Array.isArray(msg.content)) {
+    const types = msg.content.map(c => c.type).filter(Boolean);
+    const textParts = msg.content.filter(c => c.type === 'text').map(c => (c.text || '').slice(0, 80));
+    if (textParts.length) return textParts[0];
+    return types.join(', ');
+  }
+  return '';
+}
+
+function toggleRawMsgBody(elId) {
+  const el = document.getElementById(elId);
+  if (el) el.classList.toggle('open');
+}
+
+function copyRawMessage(hbIdx, msgIdx) {
+  const cacheKey = selectedId + ':' + hbIdx;
+  const data = rawMessageCache[cacheKey];
+  if (!data?.messages?.[msgIdx]) return;
+  navigator.clipboard.writeText(JSON.stringify(data.messages[msgIdx].raw, null, 2));
+}
+
+function copyAllRawMessages(hbIdx) {
+  const cacheKey = selectedId + ':' + hbIdx;
+  const data = rawMessageCache[cacheKey];
+  if (!data?.messages) return;
+  const all = data.messages.map(m => m.raw);
+  navigator.clipboard.writeText(JSON.stringify(all, null, 2));
 }
 
 // ── Cleanup heartbeats ───────────────────────────────────────────────────────
