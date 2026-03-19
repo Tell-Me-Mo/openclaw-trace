@@ -150,6 +150,9 @@ function attachToolResult(step, msg) {
   step.resultTotalSize = (step.resultTotalSize || 0) + size;
 }
 
+// Sanitize numeric value: ensure it's a finite non-negative number
+function safeNum(v) { return (typeof v === 'number' && isFinite(v) && v >= 0) ? v : 0; }
+
 function parseHeartbeats(entries, sessionFile) {
   const runs = [];
   let cur = null;
@@ -208,7 +211,7 @@ function parseHeartbeats(entries, sessionFile) {
 
     if (msg.role === 'assistant' && cur) {
       const u     = msg.usage;
-      const cost  = u?.cost?.total ?? 0;
+      const cost  = safeNum(u?.cost?.total);
       const text  = extractText(msg);
       const calls = extractToolCalls(msg);
       const ts    = e.timestamp || msg.timestamp || null;
@@ -217,15 +220,15 @@ function parseHeartbeats(entries, sessionFile) {
       if (u && (u.totalTokens > 0 || u.output > 0) || hasContent) {
         cur.steps.push({
           time:             ts,
-          output:           u?.output      || 0,
-          cacheRead:        u?.cacheRead   || 0,
-          cacheWrite:       u?.cacheWrite  || 0,
-          totalTokens:      u?.totalTokens || 0,
+          output:           safeNum(u?.output),
+          cacheRead:        safeNum(u?.cacheRead),
+          cacheWrite:       safeNum(u?.cacheWrite),
+          totalTokens:      safeNum(u?.totalTokens),
           cost,
-          costInput:        u?.cost?.input      ?? 0,
-          costOutput:       u?.cost?.output     ?? 0,
-          costCacheRead:    u?.cost?.cacheRead  ?? 0,
-          costCacheWrite:   u?.cost?.cacheWrite ?? 0,
+          costInput:        safeNum(u?.cost?.input),
+          costOutput:       safeNum(u?.cost?.output),
+          costCacheRead:    safeNum(u?.cost?.cacheRead),
+          costCacheWrite:   safeNum(u?.cost?.cacheWrite),
           toolCalls:        calls,
           toolResults:      [],
           resultTotalSize:  0,
@@ -234,9 +237,9 @@ function parseHeartbeats(entries, sessionFile) {
           durationMs:       null,
         });
         cur.totalCost    += cost;
-        cur.totalTokensSum += u?.totalTokens || 0;
-        cur.totalOutput  += u?.output || 0;
-        cur.finalContext  = Math.max(cur.finalContext, u?.totalTokens || 0);
+        cur.totalTokensSum += safeNum(u?.totalTokens);
+        cur.totalOutput  += safeNum(u?.output);
+        cur.finalContext  = Math.max(cur.finalContext, safeNum(u?.totalTokens));
         cur.endTime       = ts;
         if (text && calls.length === 0) cur.summary = text;
       } else if (u && u.totalTokens === 0 && u.output === 0 && !hasContent) {
