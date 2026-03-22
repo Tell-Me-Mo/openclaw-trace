@@ -792,7 +792,8 @@ http.createServer(async (req, res) => {
   // GET /api/agents - List all agents with summary stats
   if (url === '/api/agents') {
     try {
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const agents = data.agents.map(a => ({
         id: a.id,
         name: a.name,
@@ -821,7 +822,8 @@ http.createServer(async (req, res) => {
     try {
       const agentId = url.split('/api/agent/')[1].split('?')[0];
       const errorsOnly = params.get('errors_only') === 'true' || params.get('errorsOnly') === 'true';
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const agent = data.agents.find(a => a.id === agentId);
       if (!agent) {
         res.writeHead(404);
@@ -849,7 +851,8 @@ http.createServer(async (req, res) => {
       const limit = parseInt(params.get('limit') || '10', 10);
       const errorsOnly = params.get('errors') === 'true';
       const minCost = parseFloat(params.get('minCost') || '0');
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
 
       let heartbeats = [];
       for (const a of data.agents) {
@@ -901,7 +904,8 @@ http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'agent parameter required' }));
         return;
       }
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const agent = data.agents.find(a => a.id === agentId);
       if (!agent || !agent.heartbeats?.length) {
         res.writeHead(404);
@@ -931,7 +935,8 @@ http.createServer(async (req, res) => {
         return;
       }
 
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const agent = data.agents.find(a => a.id === agentId);
       if (!agent || !agent.heartbeats?.length) {
         res.writeHead(404);
@@ -965,7 +970,8 @@ http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'agent parameter required' }));
         return;
       }
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const agent = data.agents.find(a => a.id === agentId);
       if (!agent || !agent.heartbeats?.length) {
         res.writeHead(404);
@@ -1003,7 +1009,8 @@ http.createServer(async (req, res) => {
   // GET /api/budget - Get budget status
   if (url === '/api/budget') {
     try {
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const budget = data.budget || {};
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -1028,7 +1035,8 @@ http.createServer(async (req, res) => {
   if (url === '/api/daily') {
     try {
       const days = parseInt(params.get('days') || '7', 10);
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const today = new Date();
       const dailySummary = [];
 
@@ -1065,7 +1073,8 @@ http.createServer(async (req, res) => {
   // GET /api/stats - Overall statistics
   if (url === '/api/stats') {
     try {
-      const data = loadAll();
+      const includeReset = params.get('include_reset') === '1';
+      const data = loadAll({ includeReset });
       const totalCost = data.agents.reduce((s, a) => s + (a.totalCost || 0), 0);
       const totalTk = data.agents.reduce((s, a) => s + (a.totalTokensSum || 0), 0);
       const totalHbs = data.agents.reduce((s, a) => s + (a.heartbeats?.length || 0), 0);
@@ -2800,8 +2809,9 @@ function heartbeatRow(hb, i, total) {
   const hbCls = compareSelected ? 'style="background:var(--blue)11"' : '';
 
   // API URLs
-  const apiUrl = \`http://127.0.0.1:3141/api/heartbeat?agent=\${selectedId}&hb=\${i}\`;
-  const apiUrlErrors = \`http://127.0.0.1:3141/api/heartbeat?agent=\${selectedId}&hb=\${i}&errors_only=true\`;
+  const resetParam = includeReset ? '&include_reset=1' : '';
+  const apiUrl = \`http://127.0.0.1:3141/api/heartbeat?agent=\${selectedId}&hb=\${i}\${resetParam}\`;
+  const apiUrlErrors = \`http://127.0.0.1:3141/api/heartbeat?agent=\${selectedId}&hb=\${i}&errors_only=true\${resetParam}\`;
 
   return \`<div class="hb" id="hb\${i}" \${hbCls}>
     <div class="hb-head \${isOpen?'open':''}" onclick="toggleHb(\${i})" \${hbCls}>
