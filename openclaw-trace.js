@@ -1190,7 +1190,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 /* ── Sidebar ── */
 #sidebar{width:230px;background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;transition:margin-left .3s,opacity .3s}
 #sidebar.collapsed{margin-left:-230px;opacity:0;pointer-events:none}
-#sidebar-head{padding:14px 16px;border-bottom:1px solid var(--border);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;font-weight:600}
 .agent-row{padding:10px 16px;cursor:pointer;border-bottom:1px solid var(--border)33;transition:all .15s}
 .agent-row:hover{background:var(--surface2)}
 .agent-row.active{background:var(--accent)15;border-left:3px solid var(--blue);padding-left:13px}
@@ -1199,6 +1198,39 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 .agent-cost{color:var(--green);font-family:var(--font-mono);font-size:10px}
 .no-data{color:var(--border-light)}
 .err-count{background:var(--red)18;color:var(--red);font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700}
+
+/* ── Category groups ── */
+.cat-header{display:flex;align-items:center;padding:8px 12px 8px 10px;cursor:pointer;user-select:none;border-bottom:1px solid var(--border)33;background:var(--surface);position:sticky;top:0;z-index:2}
+.cat-header:hover{background:var(--surface2)}
+.cat-chevron{font-size:10px;width:16px;text-align:center;color:var(--muted);transition:transform .15s;flex-shrink:0}
+.cat-chevron.collapsed{transform:rotate(-90deg)}
+.cat-label{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-left:4px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cat-count{font-size:9px;color:var(--muted2);margin-left:6px;flex-shrink:0}
+.cat-actions{display:flex;gap:2px;margin-left:4px;opacity:0;transition:opacity .15s}
+.cat-header:hover .cat-actions{opacity:1}
+.cat-actions button{font-size:11px;padding:1px 5px;border:none;background:transparent;color:var(--muted);cursor:pointer;border-radius:3px;line-height:1}
+.cat-actions button:hover{background:var(--surface3);color:var(--text)}
+.cat-group.collapsed .agent-row{display:none}
+.cat-uncat .cat-label{font-style:italic}
+#sidebar-head{padding:14px 16px;border-bottom:1px solid var(--border);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;font-weight:600;display:flex;align-items:center}
+#sidebar-head-text{flex:1}
+#add-cat-btn{font-size:14px;padding:0 6px;border:none;background:transparent;color:var(--muted);cursor:pointer;border-radius:3px;line-height:1;margin-left:auto}
+#add-cat-btn:hover{color:var(--text);background:var(--surface2)}
+
+/* ── Context menu ── */
+.ctx-menu{position:fixed;z-index:9999;background:var(--surface);border:1px solid var(--border-light);border-radius:6px;padding:4px 0;min-width:180px;box-shadow:0 8px 24px rgba(0,0,0,.3);font-size:12px}
+.ctx-menu-item{padding:6px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;color:var(--text);white-space:nowrap}
+.ctx-menu-item:hover{background:var(--surface2)}
+.ctx-menu-item.danger{color:var(--red)}
+.ctx-menu-item.danger:hover{background:var(--red)12}
+.ctx-menu-sep{height:1px;background:var(--border);margin:4px 0}
+.ctx-menu-sub{position:relative}
+.ctx-menu-sub .ctx-submenu{display:none;position:absolute;left:100%;top:-4px;background:var(--surface);border:1px solid var(--border-light);border-radius:6px;padding:4px 0;min-width:150px;box-shadow:0 8px 24px rgba(0,0,0,.3)}
+.ctx-menu-sub:hover .ctx-submenu{display:block}
+.ctx-menu-item .checkmark{color:var(--green);font-size:11px;width:14px}
+
+/* ── Category inline edit ── */
+.cat-edit-input{background:var(--surface3);border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:10.5px;padding:2px 6px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;width:100%;outline:none}
 
 /* ── Main ── */
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
@@ -1493,8 +1525,7 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 <body>
 
 <div id="sidebar">
-  <div id="sidebar-head">🦞 Agents</div>
-  <!-- sidebar-head text is updated dynamically by toggleLang/init -->
+  <div id="sidebar-head"><span id="sidebar-head-text">🦞 Agents</span><button id="add-cat-btn" onclick="addCategory()" title="Add category">+</button></div>
   <div id="agent-list"></div>
 </div>
 
@@ -1541,6 +1572,132 @@ const HB_PAGE_SIZE = 20;
 let includeReset = localStorage.getItem('includeReset') === '1';
 let refreshMs = parseInt(localStorage.getItem('refreshMs')) || 5000;
 let refreshTimer = null;
+
+// ── Agent Categories ─────────────────────────────────────────────────────────
+// Categories: [{ id, name, collapsed, agentIds[] }]
+let agentCategories = [];
+try {
+  const stored = localStorage.getItem('agentCategories');
+  if (stored) agentCategories = JSON.parse(stored);
+} catch {}
+
+function saveCategories() {
+  try { localStorage.setItem('agentCategories', JSON.stringify(agentCategories)); } catch {}
+}
+
+function genCatId() { return 'cat_' + Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
+
+function addCategory(name) {
+  const catName = name || prompt(t('categoryName'), t('newCategoryName'));
+  if (!catName || !catName.trim()) return;
+  agentCategories.push({ id: genCatId(), name: catName.trim(), collapsed: false, agentIds: [] });
+  saveCategories();
+  renderSidebar();
+}
+
+function renameCategory(catId) {
+  const cat = agentCategories.find(c => c.id === catId);
+  if (!cat) return;
+  const newName = prompt(t('categoryName'), cat.name);
+  if (!newName || !newName.trim()) return;
+  cat.name = newName.trim();
+  saveCategories();
+  renderSidebar();
+}
+
+function deleteCategory(catId) {
+  const cat = agentCategories.find(c => c.id === catId);
+  if (!cat) return;
+  if (!confirm(t('deleteCategoryConfirm').replace('{name}', cat.name))) return;
+  agentCategories = agentCategories.filter(c => c.id !== catId);
+  saveCategories();
+  renderSidebar();
+}
+
+function toggleCategoryCollapse(catId) {
+  const cat = agentCategories.find(c => c.id === catId);
+  if (cat) { cat.collapsed = !cat.collapsed; saveCategories(); renderSidebar(); }
+}
+
+function toggleUncatCollapse() {
+  const stored = localStorage.getItem('uncatCollapsed') === '1';
+  localStorage.setItem('uncatCollapsed', stored ? '0' : '1');
+  renderSidebar();
+}
+
+function moveAgentToCategory(agentId, catId) {
+  // Remove from all categories first
+  for (const cat of agentCategories) {
+    cat.agentIds = cat.agentIds.filter(id => id !== agentId);
+  }
+  // Add to target if specified
+  if (catId) {
+    const cat = agentCategories.find(c => c.id === catId);
+    if (cat) cat.agentIds.push(agentId);
+  }
+  saveCategories();
+  renderSidebar();
+}
+
+function getAgentCategory(agentId) {
+  return agentCategories.find(c => c.agentIds.includes(agentId)) || null;
+}
+
+// ── Context Menu ─────────────────────────────────────────────────────────────
+function closeCtxMenu() {
+  const el = document.getElementById('ctx-menu');
+  if (el) el.remove();
+}
+
+function showCtxMenu(e, html) {
+  e.preventDefault();
+  e.stopPropagation();
+  closeCtxMenu();
+  const menu = document.createElement('div');
+  menu.id = 'ctx-menu';
+  menu.className = 'ctx-menu';
+  menu.innerHTML = html;
+  document.body.appendChild(menu);
+  // Position
+  const rect = menu.getBoundingClientRect();
+  let x = e.clientX, y = e.clientY;
+  if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 8;
+  if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 8;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+
+document.addEventListener('click', closeCtxMenu);
+document.addEventListener('contextmenu', function(e) {
+  if (!e.target.closest('.agent-row') && !e.target.closest('.cat-header')) closeCtxMenu();
+});
+
+function showAgentCtxMenu(e, agentId) {
+  const currentCat = getAgentCategory(agentId);
+  const q = String.fromCharCode(39); // single quote for onclick attrs
+  const catItems = agentCategories.map(cat => {
+    const check = currentCat && currentCat.id === cat.id ? '\u2713' : '&nbsp;';
+    return '<div class="ctx-menu-item" onclick="moveAgentToCategory(' + q + agentId + q + ',' + q + cat.id + q + ');closeCtxMenu()"><span class="checkmark">' + check + '</span>' + esc(cat.name) + '</div>';
+  }).join('');
+
+  const removeItem = currentCat
+    ? '<div class="ctx-menu-sep"></div><div class="ctx-menu-item" onclick="moveAgentToCategory(' + q + agentId + q + ',null);closeCtxMenu()">' + t('removeFromCategory') + '</div>'
+    : '';
+
+  const newCatItem = '<div class="ctx-menu-sep"></div><div class="ctx-menu-item" onclick="closeCtxMenu();addCategory()">' + t('addCategory') + '</div>';
+
+  const html = (catItems ? '<div style="padding:4px 14px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">' + t('moveTo') + '</div>' + catItems : '')
+    + removeItem + newCatItem;
+
+  showCtxMenu(e, html);
+}
+
+function showCatCtxMenu(e, catId) {
+  const q = String.fromCharCode(39);
+  const html = '<div class="ctx-menu-item" onclick="closeCtxMenu();renameCategory(' + q + catId + q + ')">' + t('renameCategory') + '</div>'
+    + '<div class="ctx-menu-item danger" onclick="closeCtxMenu();deleteCategory(' + q + catId + q + ')">' + t('deleteCategory') + '</div>';
+  showCtxMenu(e, html);
+}
 
 // Get a stable key for a heartbeat (startTime or fallback)
 function hbKey(hb) { return hb.startTime || null; }
@@ -1717,6 +1874,16 @@ const I18N = {
     optimizationHints: '⚠ Optimization hints',
     yest: 'Yest',
     model: 'Model',
+    categories: 'Categories',
+    uncategorized: 'Uncategorized',
+    addCategory: 'New category',
+    renameCategory: 'Rename',
+    deleteCategory: 'Delete category',
+    deleteCategoryConfirm: 'Delete category "{name}"? Agents will become uncategorized.',
+    moveTo: 'Move to…',
+    removeFromCategory: 'Remove from category',
+    categoryName: 'Category name:',
+    newCategoryName: 'New Category',
   },
   zh: {
     agents: '代理',
@@ -1844,6 +2011,16 @@ const I18N = {
     optimizationHints: '⚠ 优化提示',
     yest: '昨',
     model: '模型',
+    categories: '分类',
+    uncategorized: '未分类',
+    addCategory: '新建分类',
+    renameCategory: '重命名',
+    deleteCategory: '删除分类',
+    deleteCategoryConfirm: '删除分类 "{name}"？代理将变为未分类。',
+    moveTo: '移动到…',
+    removeFromCategory: '移出分类',
+    categoryName: '分类名称：',
+    newCategoryName: '新分类',
   }
 };
 let lang = localStorage.getItem('lang') || 'en';
@@ -2302,31 +2479,80 @@ function toolFreqBar(steps) {
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
+function renderAgentRow(a) {
+  const last = a.heartbeats?.[0];
+  const cls  = a.id===selectedId ? 'active' : '';
+  const cost = last ? dFmt(last.totalCost, last.totalTokensSum) : '\u2014';
+  const ago  = fAgo(a.lastTime);
+  const hbn  = a.heartbeats?.length||0;
+  const errBadge = a.totalErrors ? '<span class="err-count">\u26a0' + a.totalErrors + '</span>' : '';
+  const ageMs = a.lastTime ? Date.now() - a.lastTime : Infinity;
+  const dotColor = ageMs < 900000 ? 'var(--green)' : ageMs < 3600000 ? 'var(--orange)' : 'var(--border)';
+  const liveDot = '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + dotColor + ';margin-right:4px"></span>';
+  const q = String.fromCharCode(39);
+  return '<div class="agent-row ' + cls + '" onclick="select(' + q + a.id + q + ')" oncontextmenu="showAgentCtxMenu(event,' + q + a.id + q + ')">'
+    + '<div class="agent-name">' + liveDot + a.emoji + ' ' + a.name + ' ' + errBadge + '</div>'
+    + '<div class="agent-sub">'
+    + '<span class="agent-cost ' + (!last?'no-data':'') + '">' + cost + '</span>'
+    + (ago ? '<span>' + ago + '</span>' : '')
+    + (hbn ? '<span>' + hbn + ' hb</span>' : '')
+    + '</div></div>';
+}
+
 function renderSidebar() {
   if (!DATA) return;
   const agents = DATA.agents || [];
-  document.getElementById('agent-list').innerHTML = agents.map(a => {
-    const last = a.heartbeats?.[0];
-    const cls  = a.id===selectedId ? 'active' : '';
-    const cost = last ? dFmt(last.totalCost, last.totalTokensSum) : '—';
-    const ago  = fAgo(a.lastTime);
-    const hbn  = a.heartbeats?.length||0;
-    const errBadge = a.totalErrors ? \`<span class="err-count">⚠\${a.totalErrors}</span>\` : '';
+  const agentMap = {};
+  for (const a of agents) agentMap[a.id] = a;
 
-    // Live status dot
-    const ageMs = a.lastTime ? Date.now() - a.lastTime : Infinity;
-    const dotColor = ageMs < 900000 ? 'var(--green)' : ageMs < 3600000 ? 'var(--orange)' : 'var(--border)'; // 15min green, 1hr yellow, else grey
-    const liveDot = \`<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:\${dotColor};margin-right:4px"></span>\`;
+  // If no categories exist, render flat list (original behavior)
+  if (!agentCategories.length) {
+    document.getElementById('agent-list').innerHTML = agents.map(a => renderAgentRow(a)).join('');
+    return;
+  }
 
-    return \`<div class="agent-row \${cls}" onclick="select('\${a.id}')">
-      <div class="agent-name">\${liveDot}\${a.emoji} \${a.name} \${errBadge}</div>
-      <div class="agent-sub">
-        <span class="agent-cost \${!last?'no-data':''}">\${cost}</span>
-        \${ago?\`<span>\${ago}</span>\`:''}
-        \${hbn ?\`<span>\${hbn} hb</span>\`:''}
-      </div>
-    </div>\`;
-  }).join('');
+  let html = '';
+  const categorized = new Set();
+
+  // Render each category
+  const q = String.fromCharCode(39);
+  for (const cat of agentCategories) {
+    const catAgents = cat.agentIds.map(id => agentMap[id]).filter(Boolean);
+    for (const a of catAgents) categorized.add(a.id);
+    const chevronCls = cat.collapsed ? ' collapsed' : '';
+    const groupCls = cat.collapsed ? ' collapsed' : '';
+
+    html += '<div class="cat-group' + groupCls + '">'
+      + '<div class="cat-header" onclick="toggleCategoryCollapse(' + q + cat.id + q + ')" oncontextmenu="showCatCtxMenu(event,' + q + cat.id + q + ')">'
+      + '<span class="cat-chevron' + chevronCls + '">\u25bc</span>'
+      + '<span class="cat-label">' + esc(cat.name) + '</span>'
+      + '<span class="cat-count">' + catAgents.length + '</span>'
+      + '<span class="cat-actions" onclick="event.stopPropagation()">'
+      + '<button onclick="renameCategory(' + q + cat.id + q + ')" title="' + t('renameCategory') + '">\u270e</button>'
+      + '<button onclick="deleteCategory(' + q + cat.id + q + ')" title="' + t('deleteCategory') + '">\u2715</button>'
+      + '</span></div>'
+      + catAgents.map(a => renderAgentRow(a)).join('')
+      + '</div>';
+  }
+
+  // Uncategorized agents
+  const uncatAgents = agents.filter(a => !categorized.has(a.id));
+  if (uncatAgents.length) {
+    const uncatCollapsed = localStorage.getItem('uncatCollapsed') === '1';
+    const chevronCls = uncatCollapsed ? ' collapsed' : '';
+    const groupCls = uncatCollapsed ? ' collapsed' : '';
+
+    html += '<div class="cat-group cat-uncat' + groupCls + '">'
+      + '<div class="cat-header" onclick="toggleUncatCollapse()">'
+      + '<span class="cat-chevron' + chevronCls + '">\u25bc</span>'
+      + '<span class="cat-label">' + t('uncategorized') + '</span>'
+      + '<span class="cat-count">' + uncatAgents.length + '</span>'
+      + '</div>'
+      + uncatAgents.map(a => renderAgentRow(a)).join('')
+      + '</div>';
+  }
+
+  document.getElementById('agent-list').innerHTML = html;
 }
 
 // ── Cross-agent overview ──────────────────────────────────────────────────────
@@ -3174,7 +3400,7 @@ function toggleLang() {
   renderSidebar();
   updateDailyPill();
   updateBudget();
-  document.getElementById('sidebar-head').textContent = '🦞 ' + t('agents');
+  document.getElementById('sidebar-head-text').textContent = '🦞 ' + t('agents');
   document.getElementById('refresh-text').textContent = t('autoRefresh');
   document.getElementById('reset-toggle-btn').textContent = t('resetFiles');
   document.getElementById('sidebar-toggle').title = t('toggleSidebar');
@@ -3669,7 +3895,7 @@ document.getElementById('theme-btn').textContent = theme === 'dark' ? '☀' : '�
 document.getElementById('lang-btn').textContent = lang === 'en' ? '中' : 'EN';
 document.getElementById('reset-toggle-btn').textContent = t('resetFiles');
 document.getElementById('reset-toggle-btn').style.opacity = includeReset ? 1 : 0.5;
-document.getElementById('sidebar-head').textContent = '🦞 ' + t('agents');
+document.getElementById('sidebar-head-text').textContent = '🦞 ' + t('agents');
 document.getElementById('refresh-text').textContent = t('autoRefresh');
 document.getElementById('refresh-interval').value = refreshMs;
 document.querySelector('#content .empty').textContent = t('selectAgent');
