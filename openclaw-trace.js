@@ -2517,7 +2517,8 @@ function renderSidebar() {
   // Render each category
   const q = String.fromCharCode(39);
   for (const cat of agentCategories) {
-    const catAgents = cat.agentIds.map(id => agentMap[id]).filter(Boolean);
+    const catAgents = cat.agentIds.map(id => agentMap[id]).filter(Boolean)
+      .sort((a, b) => (b.lastTime || 0) - (a.lastTime || 0));
     for (const a of catAgents) categorized.add(a.id);
     const chevronCls = cat.collapsed ? ' collapsed' : '';
     const groupCls = cat.collapsed ? ' collapsed' : '';
