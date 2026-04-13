@@ -98,7 +98,10 @@ function saveShadowEntries(agentId, sourceFile, lines) {
 
 // Watch all agent session directories for JSONL changes
 const watchers = {};
+const CLAUDE_HOME = path.join(os.homedir(), '.claude', 'projects');
+
 function startWatching() {
+  // Watch OpenClaw agent sessions
   const agentsDir = path.join(OC, 'agents');
   try {
     const agents = fs.readdirSync(agentsDir);
@@ -107,7 +110,6 @@ function startWatching() {
       watchSessionDir(sessDir);
     }
   } catch {}
-  // Also watch the agents dir for new agents
   try {
     fs.watch(agentsDir, (ev, filename) => {
       if (filename) {
@@ -116,16 +118,40 @@ function startWatching() {
       }
     });
   } catch {}
+
+  // Watch Claude Code project sessions
+  try {
+    const projects = fs.readdirSync(CLAUDE_HOME);
+    for (const proj of projects) {
+      const projDir = path.join(CLAUDE_HOME, proj);
+      watchSessionDir(projDir);
+    }
+  } catch {}
+  try {
+    fs.watch(CLAUDE_HOME, (ev, filename) => {
+      if (filename) {
+        const projDir = path.join(CLAUDE_HOME, filename);
+        watchSessionDir(projDir);
+      }
+    });
+  } catch {}
 }
 
 function watchSessionDir(sessDir) {
   if (watchers[sessDir]) return;
   try {
-    // Snapshot existing JSONL files
+    // Snapshot only recent JSONL files (today + yesterday) to limit memory usage
+    const recentCutoff = new Date();
+    recentCutoff.setDate(recentCutoff.getDate() - 1);
+    recentCutoff.setHours(0, 0, 0, 0);
+    const cutoffMs = recentCutoff.getTime();
     const files = fs.readdirSync(sessDir);
     for (const file of files) {
       if (file.endsWith('.jsonl')) {
-        snapshotFile(path.join(sessDir, file));
+        const fp = path.join(sessDir, file);
+        try {
+          if (fs.statSync(fp).mtimeMs >= cutoffMs) snapshotFile(fp);
+        } catch {}
       }
     }
     // Watch for changes
@@ -148,10 +174,153 @@ function readJSON(p) {
 
 function readJSONL(p) {
   try {
-    return fs.readFileSync(p, 'utf8').trim().split('\n')
+    const entries = fs.readFileSync(p, 'utf8').trim().split('\n')
       .map(l => { try { return JSON.parse(l); } catch { return null; } })
       .filter(Boolean);
+    // Auto-detect Claude Code format and normalize
+    // Claude Code entries have sessionId + type fields like "user", "assistant", "queue-operation"
+    const isClaudeCode = entries.some(e => e.sessionId && e.type && (e.type === 'assistant' || e.type === 'user') && e.uuid);
+    if (isClaudeCode) {
+      return normalizeClaudeCodeEntries(entries);
+    }
+    return entries;
   } catch { return []; }
+}
+
+// ── Claude Code JSONL adapter ────────────────────────────────────────────────
+// Converts Claude Code JSONL entries to OpenClaw format for unified parsing
+
+// Token pricing per model (per million tokens)
+const CLAUDE_PRICING = {
+  'claude-opus-4-6':   { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  'claude-sonnet-4-6': { input: 3,  output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  'claude-haiku-4-5':  { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 },
+};
+
+function calcCost(model, usage) {
+  const p = CLAUDE_PRICING[model] || CLAUDE_PRICING['claude-sonnet-4-6'];
+  const inp = (usage.input_tokens || 0) / 1e6 * p.input;
+  const out = (usage.output_tokens || 0) / 1e6 * p.output;
+  const cr  = (usage.cache_read_input_tokens || 0) / 1e6 * p.cacheRead;
+  const cw  = ((usage.cache_creation_input_tokens || 0)) / 1e6 * p.cacheWrite;
+  return { input: inp, output: out, cacheRead: cr, cacheWrite: cw, total: inp + out + cr + cw };
+}
+
+function normalizeClaudeCodeEntries(entries) {
+  // Phase 1: Collect all assistant entries per requestId
+  const assistantByReq = new Map();
+  for (const e of entries) {
+    if (e.type === 'assistant' && e.message?.role === 'assistant' && e.requestId) {
+      if (!assistantByReq.has(e.requestId)) assistantByReq.set(e.requestId, []);
+      assistantByReq.get(e.requestId).push(e);
+    }
+  }
+
+  // Phase 2: Merge each requestId group into a single normalized entry
+  const mergedAssistants = new Map(); // requestId -> merged entry
+  for (const [rid, group] of assistantByReq) {
+    mergedAssistants.set(rid, mergeAssistantGroup(group));
+  }
+
+  // Phase 3: Walk entries in order, emit normalized sequence
+  const normalized = [];
+  const emittedReqs = new Set();
+
+  for (const e of entries) {
+    const t = e.type;
+    const msg = e.message;
+    if (!msg) continue;
+
+    if (t === 'user' && msg.role === 'user') {
+      const content = Array.isArray(msg.content) ? msg.content : [];
+      const allToolResults = content.length > 0 && content.every(c => c.type === 'tool_result');
+
+      if (allToolResults) {
+        for (const c of content) {
+          const resultText = Array.isArray(c.content)
+            ? c.content.filter(x => x.type === 'text').map(x => x.text || '').join('')
+            : String(c.content || '');
+          normalized.push({
+            timestamp: e.timestamp,
+            message: {
+              role: 'toolResult',
+              toolName: '',
+              toolCallId: c.tool_use_id || '',
+              content: resultText,
+              isError: c.is_error || false,
+            }
+          });
+        }
+      } else {
+        normalized.push({
+          timestamp: e.timestamp,
+          message: { role: 'user', content: msg.content, timestamp: e.timestamp }
+        });
+      }
+      continue;
+    }
+
+    if (t === 'assistant' && e.requestId && !emittedReqs.has(e.requestId)) {
+      // Emit the merged entry on first encounter of this requestId
+      emittedReqs.add(e.requestId);
+      const merged = mergedAssistants.get(e.requestId);
+      if (merged) normalized.push(merged);
+    }
+  }
+
+  return normalized;
+}
+
+function mergeAssistantGroup(entries) {
+  // Merge multiple Claude Code assistant entries (same requestId) into one OpenClaw-format entry
+  const textParts = [];
+  const thinkingParts = [];
+  const toolCalls = [];
+  let model = '';
+  let timestamp = '';
+  let usage = null;
+
+  for (const e of entries) {
+    const msg = e.message || {};
+    if (!timestamp) timestamp = e.timestamp;
+    if (msg.model) model = msg.model;
+
+    // Take usage with the highest output_tokens (last entry has cumulative total)
+    if (msg.usage && (msg.usage.output_tokens || 0) > (usage?.output_tokens || 0)) usage = msg.usage;
+
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    for (const c of content) {
+      if (c.type === 'text' && c.text) textParts.push(c.text);
+      if (c.type === 'thinking' && c.thinking) thinkingParts.push(c.thinking);
+      if (c.type === 'tool_use') {
+        toolCalls.push({ type: 'toolCall', id: c.id || '', name: c.name || '', arguments: c.input || {} });
+      }
+    }
+  }
+
+  // Use the entry with the highest output_tokens for usage (cumulative)
+  if (!usage) usage = {};
+  const input = usage.input_tokens || 0;
+  const cacheRead = usage.cache_read_input_tokens || 0;
+  const cacheWrite = usage.cache_creation_input_tokens || 0;
+  const output = usage.output_tokens || 0;
+  const cost = calcCost(model, usage);
+
+  const normContent = [];
+  for (const text of textParts) normContent.push({ type: 'text', text });
+  for (const tc of toolCalls) normContent.push(tc);
+
+  return {
+    timestamp,
+    message: {
+      role: 'assistant',
+      content: normContent,
+      model,
+      timestamp,
+      thinking: thinkingParts.length > 0 ? thinkingParts.join('\n') : undefined,
+      usage: { input, output, cacheRead, cacheWrite, totalTokens: input + output + cacheRead + cacheWrite, cost },
+    }
+  };
 }
 
 function getAgentMeta() {
@@ -332,6 +501,7 @@ function parseHeartbeats(entries, sessionFile) {
           resultTotalSize:  0,
           text,
           model:            msg.model || '',
+          thinking:         msg.thinking || '',
           durationMs:       null,
         });
         cur.totalCost    += cost;
@@ -587,6 +757,12 @@ function cleanStepForAPI(step) {
     toolCalls: step.toolCalls,
     toolResults: step.toolResults,
     cost: step.cost,
+    model: step.model || undefined,
+    totalTokens: step.totalTokens || undefined,
+    output: step.output || undefined,
+    cacheRead: step.cacheRead || undefined,
+    cacheWrite: step.cacheWrite || undefined,
+    thinking: step.thinking || undefined,
   };
 }
 
@@ -635,6 +811,10 @@ function loadAll(opts = {}) {
   const dailyHbs   = {}; // { "2026-02-11": count }
   const dailyByAgent = {}; // { "2026-02-11": { agentId: cost } }
 
+  // Only load session files modified today or yesterday to limit memory usage
+  const now = new Date();
+  const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+
   for (const [id, info] of Object.entries(meta)) {
     const sessDir = path.join(OC, 'agents', id, 'sessions');
     const sessFile = path.join(sessDir, 'sessions.json');
@@ -651,13 +831,16 @@ function loadAll(opts = {}) {
     let contextTokens = 200000;
     let totalTokens   = 0;
 
-    // Read ALL .jsonl files in sessions directory (not just registered ones)
+    // Read .jsonl files modified today or yesterday to limit memory usage
     const allSessionFiles = [];
     try {
       const files = fs.readdirSync(sessDir);
       for (const file of files) {
         if (file.endsWith('.jsonl') || (includeReset && file.includes('.jsonl.reset.'))) {
-          allSessionFiles.push(path.join(sessDir, file));
+          const fp = path.join(sessDir, file);
+          try {
+            if (fs.statSync(fp).mtimeMs >= cutoff) allSessionFiles.push(fp);
+          } catch {}
         }
       }
     } catch (e) {
@@ -666,9 +849,11 @@ function loadAll(opts = {}) {
 
     // Include shadow file with preserved (truncated) heartbeat entries
     const shadowFile = path.join(SHADOW_DIR, id + '.jsonl');
-    if (fs.existsSync(shadowFile)) {
-      allSessionFiles.push(shadowFile);
-    }
+    try {
+      if (fs.existsSync(shadowFile) && fs.statSync(shadowFile).mtimeMs >= cutoff) {
+        allSessionFiles.push(shadowFile);
+      }
+    } catch {}
 
     // Prefer registered sessions for metadata
     for (const sess of Object.values(sessions)) {
@@ -721,6 +906,85 @@ function loadAll(opts = {}) {
 
     agents.push({ ...info, model, contextTokens, totalTokens, totalCost, totalTokensSum, totalErrors, lastTime, heartbeats: uniqueHbs, avgCacheHit, totalCacheReadTk, totalInputTk });
   }
+
+  // ── Claude Code project sessions ───────────────────────────────────────────
+  const existingIds = new Set(agents.map(a => a.id));
+  try {
+    const projects = fs.readdirSync(CLAUDE_HOME);
+    for (const proj of projects) {
+      const projDir = path.join(CLAUDE_HOME, proj);
+      if (!fs.statSync(projDir).isDirectory()) continue;
+
+      // Derive agent id from project directory name
+      // e.g. "-Users-mikolakondratuk--openclaw-workspace-promo-assistant-ih" -> "claude:ih"
+      const wsMatch = proj.match(/workspace-promo-assistant-(\w+)$/);
+      const id = wsMatch ? 'claude:' + wsMatch[1] : 'claude:' + proj.replace(/^-+/, '').replace(/-/g, ':').slice(0, 30);
+
+      // Skip if this workspace already has an OpenClaw agent (avoid duplicates)
+      // But add it as a separate entry with "claude:" prefix for visibility
+      if (existingIds.has(id)) continue;
+
+      const heartbeats = [];
+      let totalCost = 0, totalTokensSum = 0, totalErrors = 0;
+      let totalCacheReadTk = 0, totalInputTk = 0, lastTime = 0;
+      let model = '';
+
+      const files = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
+      for (const file of files) {
+        const filePath = path.join(projDir, file);
+        try {
+          if (fs.statSync(filePath).mtimeMs < cutoff) continue;
+        } catch { continue; }
+        const hbs = parseHeartbeats(readJSONL(filePath), filePath);
+        for (const hb of hbs) heartbeats.push(hb);
+      }
+
+      // Deduplicate
+      const seen = new Set();
+      const uniqueHbs = [];
+      heartbeats.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+      for (const hb of heartbeats) {
+        const key = hb.startTime || '';
+        if (key && seen.has(key)) continue;
+        if (key) seen.add(key);
+        uniqueHbs.push(hb);
+      }
+
+      for (const hb of uniqueHbs) {
+        totalCost += hb.totalCost;
+        totalTokensSum += hb.totalTokensSum || 0;
+        totalErrors += hb.errorCount || 0;
+        totalCacheReadTk += hb.totalCacheRead || 0;
+        totalInputTk += hb.totalInput || 0;
+        if (hb.steps?.length) model = hb.steps[0].model || model;
+        if (hb.startTime) {
+          lastTime = Math.max(lastTime, new Date(hb.startTime).getTime());
+          const d = new Date(hb.startTime);
+          const dateKey = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+          dailyCosts[dateKey] = (dailyCosts[dateKey] || 0) + hb.totalCost;
+          dailyTokens[dateKey] = (dailyTokens[dateKey] || 0) + (hb.totalTokensSum || 0);
+          dailyHbs[dateKey] = (dailyHbs[dateKey] || 0) + 1;
+          if (!dailyByAgent[dateKey]) dailyByAgent[dateKey] = {};
+          dailyByAgent[dateKey][id] = (dailyByAgent[dateKey][id] || 0) + hb.totalCost;
+        }
+      }
+
+      const avgCacheHit = uniqueHbs.length
+        ? uniqueHbs.reduce((sum, hb) => sum + (hb.cacheHitRate || 0), 0) / uniqueHbs.length
+        : 0;
+
+      const friendlyName = wsMatch ? wsMatch[1].charAt(0).toUpperCase() + wsMatch[1].slice(1) + ' (Claude)' : proj.slice(0, 20) + ' (Claude)';
+
+      agents.push({
+        id, name: friendlyName, emoji: '🟣',
+        model, contextTokens: 1000000, totalTokens: 0,
+        totalCost, totalTokensSum, totalErrors, lastTime,
+        heartbeats: uniqueHbs, avgCacheHit, totalCacheReadTk, totalInputTk,
+        source: 'claude-code',
+      });
+      existingIds.add(id);
+    }
+  } catch {}
 
   agents.sort((a, b) => (b.lastTime || 0) - (a.lastTime || 0));
 
