@@ -546,7 +546,7 @@ function finalizeRun(r) {
   // Error count (tool errors + API errors)
   r.apiErrors = r.apiErrors || 0;
   r.errorCount = r.steps.reduce((sum, s) =>
-    sum + (s.toolResults?.filter(tr => hasError(tr)).length || 0), 0) + r.apiErrors;
+    sum + (s.toolResults?.filter(tr => hasError(tr, s)).length || 0), 0) + r.apiErrors;
 
   // Browser action breakdown
   const browserBreakdown = {};
@@ -766,12 +766,40 @@ function cleanStepForAPI(step) {
   };
 }
 
-function hasError(toolResult) {
+// Benign tool_use_errors that should not be surfaced as errors in the UI
+const IGNORED_TOOL_ERRORS = [
+  'File has not been read yet',
+];
+
+function isIgnoredToolError(text) {
+  if (!text) return false;
+  return IGNORED_TOOL_ERRORS.some(sig => text.includes(sig));
+}
+
+// grep/rg return exit code 1 when no match is found — not an actual error
+function isBenignGrepExit(toolResult, step) {
+  const preview = (toolResult.preview || '').trim();
+  if (!/exit code 1\s*$/i.test(preview)) return false;
+  if (!step || !Array.isArray(step.toolCalls)) return false;
+  const call = step.toolCalls.find(tc => tc.id === toolResult.callId);
+  if (!call || call.name !== 'Bash') return false;
+  const args = call.args || call.arguments || {};
+  const cmd = args.command || '';
+  return /(^|\s|\||;|&&|\|\||\(|`)(exec\s+)?(grep|egrep|fgrep|rg|ripgrep)\b/.test(cmd);
+}
+
+function hasError(toolResult, step) {
+  if (isBenignGrepExit(toolResult, step)) return false;
+
   // Check explicit error flag
-  if (toolResult.isError) return true;
+  if (toolResult.isError) {
+    if (isIgnoredToolError(toolResult.preview || toolResult.full || '')) return false;
+    return true;
+  }
 
   // Check if result content indicates an error
   const preview = toolResult.preview || '';
+  if (isIgnoredToolError(preview)) return false;
   try {
     // Try to parse JSON result
     const parsed = JSON.parse(preview);
@@ -790,7 +818,7 @@ function cleanHeartbeatForAPI(hb, errorsOnly = false) {
   // Filter to only steps with errors if requested
   if (errorsOnly) {
     steps = steps.filter(step =>
-      step.toolResults?.some(r => hasError(r)) || false
+      step.toolResults?.some(r => hasError(r, step)) || false
     );
   }
 
@@ -2358,7 +2386,7 @@ function markAllErrorsSolved(hbIdx) {
 
     for (let resultIdx = 0; resultIdx < results.length; resultIdx++) {
       const tr = results[resultIdx];
-      if (hasErrorInResult(tr) && !isErrorSolved(selectedId, hbId, stepIdx, resultIdx)) {
+      if (hasErrorInResult(tr, step) && !isErrorSolved(selectedId, hbId, stepIdx, resultIdx)) {
         const key = getErrorKey(selectedId, hbId, stepIdx, resultIdx);
         solvedErrors[key] = true;
         markedCount++;
@@ -2387,7 +2415,7 @@ function recalculateErrorCounts(agent) {
 
       for (let resultIdx = 0; resultIdx < results.length; resultIdx++) {
         const tr = results[resultIdx];
-        if (hasErrorInResult(tr) && !isErrorSolved(agent.id, hbId, stepIdx, resultIdx)) {
+        if (hasErrorInResult(tr, step) && !isErrorSolved(agent.id, hbId, stepIdx, resultIdx)) {
           errorCount++;
         }
       }
@@ -2400,9 +2428,29 @@ function recalculateErrorCounts(agent) {
   agent.totalErrors = agent.heartbeats.reduce((sum, hb) => sum + (hb.errorCount || 0), 0);
 }
 
-function hasErrorInResult(toolResult) {
-  if (toolResult.isError) return true;
+const IGNORED_TOOL_ERROR_SIGS = ['File has not been read yet'];
+function isIgnoredToolErrorClient(text) {
+  if (!text) return false;
+  return IGNORED_TOOL_ERROR_SIGS.some(sig => text.includes(sig));
+}
+
+// grep/rg return exit code 1 when no match is found — not an actual error
+function isBenignGrepExitClient(toolResult, step) {
+  const preview = (toolResult.preview || '').trim();
+  if (!/exit code 1\\s*$/i.test(preview)) return false;
+  if (!step || !Array.isArray(step.toolCalls)) return false;
+  const call = step.toolCalls.find(tc => tc.id === toolResult.callId);
+  if (!call || call.name !== 'Bash') return false;
+  const args = call.args || call.arguments || {};
+  const cmd = args.command || '';
+  return /(^|\\s|\\||;|&&|\\|\\||\\(|\`)(exec\\s+)?(grep|egrep|fgrep|rg|ripgrep)\\b/.test(cmd);
+}
+
+function hasErrorInResult(toolResult, step) {
   const preview = toolResult.preview || '';
+  if (isBenignGrepExitClient(toolResult, step)) return false;
+  if (isIgnoredToolErrorClient(preview) || isIgnoredToolErrorClient(toolResult.full || '')) return false;
+  if (toolResult.isError) return true;
   try {
     const parsed = JSON.parse(preview);
     if (parsed.status === 'error' || parsed.error) return true;
@@ -2938,7 +2986,7 @@ function collectErrors(agents) {
       // Tool-level errors from steps
       for (const s of (hb.steps || [])) {
         for (const tr of (s.toolResults || [])) {
-          if (!hasErrorInResult(tr)) continue;
+          if (!hasErrorInResult(tr, s)) continue;
           const time = s.time || hb.startTime;
           const msg = (tr.preview || 'Unknown error').slice(0, 200);
           // Classify the error type
@@ -3431,7 +3479,7 @@ function stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open) {
   const hasStepError = (toolResults, hbId, stepIdx) => {
     if (!toolResults) return false;
     return toolResults.some((tr, resultIdx) => {
-      if (!hasErrorInResult(tr)) return false;
+      if (!hasErrorInResult(tr, s)) return false;
       // Check if this specific error is marked as solved
       return !isErrorSolved(selectedId, hbId, stepIdx, resultIdx);
     });
@@ -3568,7 +3616,7 @@ function detailCard(tc, result, hbId, stepIdx, resultIdx) {
 
   let resultHtml = '';
   if (result) {
-    const hasError = hasErrorInResult(result);
+    const hasError = hasErrorInResult(result, tc ? { toolCalls: [tc] } : null);
     const isSolved = hasError && resultIdx >= 0 && isErrorSolved(selectedId, hbId, stepIdx, resultIdx);
 
     let errBadge = '';
