@@ -810,6 +810,10 @@ function hasError(toolResult, step) {
     if (preview.includes('"status": "error"') || preview.includes('"status":"error"')) return true;
   }
 
+  // Non-zero Bash exit code — treat as error (grep/rg handled above)
+  const exitMatch = preview.match(/Exit code (\d+)/i);
+  if (exitMatch && parseInt(exitMatch[1], 10) !== 0) return true;
+
   return false;
 }
 
@@ -2458,6 +2462,8 @@ function hasErrorInResult(toolResult, step) {
   } catch {
     if (preview.includes('"status": "error"') || preview.includes('"status":"error"')) return true;
   }
+  const exitMatch = preview.match(/Exit code (\\d+)/i);
+  if (exitMatch && parseInt(exitMatch[1], 10) !== 0) return true;
   return false;
 }
 
