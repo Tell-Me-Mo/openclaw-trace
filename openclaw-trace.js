@@ -769,6 +769,7 @@ function cleanStepForAPI(step) {
 // Benign tool_use_errors that should not be surfaced as errors in the UI
 const IGNORED_TOOL_ERRORS = [
   'File has not been read yet',
+  'File has been modified since read',
   'gateway timeout after',
   'unmatched "',
 ];
@@ -2434,7 +2435,7 @@ function recalculateErrorCounts(agent) {
   agent.totalErrors = agent.heartbeats.reduce((sum, hb) => sum + (hb.errorCount || 0), 0);
 }
 
-const IGNORED_TOOL_ERROR_SIGS = ['File has not been read yet', 'gateway timeout after', 'unmatched "'];
+const IGNORED_TOOL_ERROR_SIGS = ['File has not been read yet', 'File has been modified since read', 'gateway timeout after', 'unmatched "'];
 function isIgnoredToolErrorClient(text) {
   if (!text) return false;
   return IGNORED_TOOL_ERROR_SIGS.some(sig => text.includes(sig));
