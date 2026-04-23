@@ -770,6 +770,7 @@ function cleanStepForAPI(step) {
 const IGNORED_TOOL_ERRORS = [
   'File has not been read yet',
   'gateway timeout after',
+  'unmatched "',
 ];
 
 function isIgnoredToolError(text) {
@@ -2433,7 +2434,7 @@ function recalculateErrorCounts(agent) {
   agent.totalErrors = agent.heartbeats.reduce((sum, hb) => sum + (hb.errorCount || 0), 0);
 }
 
-const IGNORED_TOOL_ERROR_SIGS = ['File has not been read yet', 'gateway timeout after'];
+const IGNORED_TOOL_ERROR_SIGS = ['File has not been read yet', 'gateway timeout after', 'unmatched "'];
 function isIgnoredToolErrorClient(text) {
   if (!text) return false;
   return IGNORED_TOOL_ERROR_SIGS.some(sig => text.includes(sig));
